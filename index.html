@@ -1,0 +1,781 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#0b0d12">
+<title>Road Pac</title>
+<link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet">
+<style>
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;height:100%;overflow:hidden;background:#0b0d12;
+    font:15px/1.35 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+    -webkit-user-select:none;user-select:none;color:#111}
+  #map{position:absolute;inset:0;touch-action:none}
+
+  #panel{position:absolute;left:12px;right:12px;top:calc(12px + env(safe-area-inset-top));
+    max-width:360px;margin:0 auto;background:#fff;border-radius:16px;padding:16px;
+    box-shadow:0 12px 40px #0007;z-index:6}
+  #panel h1{margin:0 0 2px;font-size:20px}
+  #panel .sub{margin:0 0 12px;color:#666;font-size:13px}
+  #panel label{display:block;font-size:12px;color:#555;margin:0 0 8px}
+  #panel input{width:100%;margin-top:4px;padding:10px;border:1px solid #cfcfcf;border-radius:9px;font-size:15px}
+  .row{display:flex;gap:8px;margin:2px 0 8px;flex-wrap:wrap}
+  button{font:inherit;cursor:pointer;border:1px solid #cfcfcf;background:#f6f6f6;
+    padding:10px 12px;border-radius:9px;color:#111}
+  button.primary{width:100%;background:#ffe14d;border-color:#e6c400;font-weight:700;margin-top:4px}
+  button:active{transform:translateY(1px)}
+  #status{font-size:12.5px;color:#555;min-height:32px;margin:6px 0}
+  #panel small{display:block;color:#8a8a8a;font-size:11px;margin-top:10px;line-height:1.4}
+
+  #hud{position:absolute;left:12px;top:calc(12px + env(safe-area-inset-top));z-index:4;
+    display:flex;gap:8px;align-items:center}
+  #score{background:#000000aa;color:#ffe14d;font-weight:800;padding:9px 14px;border-radius:999px;
+    box-shadow:0 4px 16px #0006}
+  #menu{background:#000000aa;color:#fff;border:none;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+
+  #stick{position:absolute;right:calc(16px + env(safe-area-inset-right));
+    bottom:calc(20px + env(safe-area-inset-bottom));z-index:4;opacity:.92;touch-action:none}
+  #stick-base{width:148px;height:148px;border-radius:50%;background:#ffffff1c;
+    border:2px solid #ffffff33;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);
+    display:flex;align-items:center;justify-content:center;position:relative;touch-action:none}
+  #stick-base::after{content:"";position:absolute;inset:24px;border-radius:50%;border:1px dashed #ffffff22}
+  #stick-knob{width:62px;height:62px;border-radius:50%;background:#ffffff55;border:2px solid #ffffff88;
+    box-shadow:0 4px 14px #0006;will-change:transform;touch-action:none}
+
+  .pac-marker{width:30px;height:30px;display:flex;align-items:center;justify-content:center;
+    filter:drop-shadow(0 1px 2px #0009)}
+  .pac-rot{will-change:transform;display:flex}
+  [hidden]{display:none!important}
+</style>
+</head>
+<body>
+<div id="map"></div>
+
+<div id="panel">
+  <h1>Road Pac</h1>
+  <p class="sub">Pac-Man over real city streets.</p>
+  <label>City or address
+    <input id="search" type="text" placeholder="e.g. Greenwich Village, NYC" autocomplete="off">
+  </label>
+  <div class="row">
+    <button id="go">Search</button>
+    <button id="loc">Use my location</button>
+  </div>
+  <p id="status">Find a city, aim the map, then start.</p>
+  <button id="start" class="primary">Start game here</button>
+  <small>Roads &copy; OpenStreetMap contributors via Overpass. Geocoding via Nominatim.
+    Geolocation needs https or localhost.</small>
+</div>
+
+<div id="hud" hidden>
+  <div id="score">Dots: 0</div>
+  <button id="menu">Menu</button>
+</div>
+
+<div id="stick" hidden>
+  <div id="stick-base"><div id="stick-knob"></div></div>
+</div>
+
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<script>
+const PAC_SVG =
+  '<svg viewBox="-1.15 -1.15 2.3 2.3" width="30" height="30">' +
+  '<path fill="#ffe14d" stroke="#caa400" stroke-width="0.05">' +
+  '<animate attributeName="d" dur="0.3s" repeatCount="indefinite" calcMode="linear" values="' +
+  'M0,0 L1,-0.02 A1,1 0 1 0 1,0.02 Z;' +
+  'M0,0 L0.62,-0.78 A1,1 0 1 0 0.62,0.78 Z;' +
+  'M0,0 L1,-0.02 A1,1 0 1 0 1,0.02 Z"/></path></svg>';
+
+const SPEED = 62;             // metres / second
+const SPEED_FACTOR = 1;       // tune later for difficulty
+const PELLET_SPACING = 25;    // metres between dots
+const EAT_RADIUS = 9;         // metres
+const CELL = 24;              // spatial grid cell (metres)
+const TURN_DOT = 0.5;         // cos(~60deg): how close a swipe must match a road
+const CONTINUE_DOT = 0.25;    // cos(~75deg): auto-continue only through gentle bends
+const PLAY_HALF = 350;        // half-size of play area (metres)
+const MERGE_DIST = 25;        // metres: dual carriageways closer than this merge into one
+const ROAD_TYPES = 'trunk|primary|secondary|tertiary|unclassified|residential';
+const OVERPASS = [
+  'https://overpass-api.de/api/interpreter',
+  'https://overpass.kumi.systems/api/interpreter',
+  'https://maps.mail.ru/osm/tools/overpass/api/interpreter'
+];
+const DRV = { up:{x:0,y:1}, down:{x:0,y:-1}, left:{x:-1,y:0}, right:{x:1,y:0} };
+
+const map = new maplibregl.Map({
+  container: 'map',
+  style: 'https://tiles.openfreemap.org/styles/dark',
+  center: [-74.0, 40.73],
+  zoom: 16,
+  dragRotate: false,
+  pitchWithRotate: false,
+  keyboard: false,
+  attributionControl: { compact: true }
+});
+map.touchZoomRotate.disableRotation();
+
+const proj = { lng0:0, lat0:0, mlon:1, mlat:111320 };
+function toXY(lng, lat){ return [ (lng-proj.lng0)*proj.mlon, (lat-proj.lat0)*proj.mlat ]; }
+function toLngLat(x, y){ return [ proj.lng0 + x/proj.mlon, proj.lat0 + y/proj.mlat ]; }
+
+const state = {
+  running:false, edges:[], adjSim:new Map(), pellets:[], grid:new Map(),
+  pac:null, score:0, last:0, dirty:false, lastPellet:0, marker:null, rot:null
+};
+let keyHeld = null;       // { x, y } from keyboard
+let stick = null;         // { x, y } from the analog joystick
+let swipe = null;         // { x, y, t } from a swipe gesture
+
+// ---------- Overpass + graph ----------
+async function fetchOverpass(bb){
+  const q = '[out:json][timeout:25];way["highway"~"^('+ROAD_TYPES+')"](' +
+    bb.south+','+bb.west+','+bb.north+','+bb.east+');(._;>;);out body;';
+  let err;
+  for(const url of OVERPASS){
+    try{
+      const res = await fetch(url, {
+        method:'POST',
+        headers:{ 'Content-Type':'application/x-www-form-urlencoded' },
+        body:'data='+encodeURIComponent(q)
+      });
+      if(!res.ok) throw new Error('HTTP '+res.status);
+      const j = await res.json();
+      if(!j.elements || !j.elements.length) throw new Error('no roads returned');
+      return j;
+    }catch(e){ err = e; }
+  }
+  throw new Error('Could not load roads ('+(err?err.message:'unknown')+')');
+}
+
+// Raw OSM nodes are dense shape points; collapse chains of degree-2 nodes into
+// single polyline edges so curves are followed smoothly and turns only happen
+// at real intersections.
+function buildGraph(osm, bb){
+  const rawXY = new Map();
+  for(const el of osm.elements){
+    if(el.type === 'node') rawXY.set(el.id, toXY(el.lon, el.lat));
+  }
+
+  const ways = [];
+  const nodeKeys = new Map();
+  const onewayKeys = new Set();
+  const rawNeighbors = new Set();
+  const pk = (a,b) => (a < b ? a+'_'+b : b+'_'+a);
+  for(const el of osm.elements){
+    if(el.type !== 'way') continue;
+    const t = el.tags || {};
+    const rkey = String(t.name || t.ref || '').trim();
+    const oneway = t.oneway === 'yes' || t.oneway === '1' || t.oneway === '-1' || t.junction === 'roundabout';
+    ways.push({ nodes: el.nodes, key: rkey, oneway });
+    if(rkey){
+      if(oneway) onewayKeys.add(rkey);
+      for(const n of el.nodes){
+        if(!nodeKeys.has(n)) nodeKeys.set(n, new Set());
+        nodeKeys.get(n).add(rkey);
+      }
+    }
+    for(let i=0; i+1<el.nodes.length; i++) rawNeighbors.add(pk(el.nodes[i], el.nodes[i+1]));
+  }
+
+  // Union nearby nodes belonging to parallel one-way carriageways of the same
+  // road, so divided roads / highways collapse to a single centreline.
+  const parent = new Map();
+  for(const id of rawXY.keys()) parent.set(id, id);
+  const find = x => { let r = x; while(parent.get(r) !== r) r = parent.get(r); while(parent.get(x) !== r){ const nx = parent.get(x); parent.set(x, r); x = nx; } return r; };
+  const union = (a,b) => { a = find(a); b = find(b); if(a !== b) parent.set(a, b); };
+
+  const cell = MERGE_DIST;
+  const buckets = new Map();
+  const bk = (x,y) => Math.floor(x/cell)+','+Math.floor(y/cell);
+  for(const id of rawXY.keys()){
+    const xy = rawXY.get(id);
+    const k = bk(xy[0], xy[1]);
+    if(!buckets.has(k)) buckets.set(k, []);
+    buckets.get(k).push(id);
+  }
+  for(const id of rawXY.keys()){
+    const keysA = nodeKeys.get(id);
+    if(!keysA) continue;
+    const xy = rawXY.get(id);
+    const cx = Math.floor(xy[0]/cell), cy = Math.floor(xy[1]/cell);
+    for(let i=-1;i<=1;i++) for(let j=-1;j<=1;j++){
+      const arr = buckets.get((cx+i)+','+(cy+j));
+      if(!arr) continue;
+      for(const id2 of arr){
+        if(id2 <= id) continue;
+        if(rawNeighbors.has(pk(id, id2))) continue;        // never merge points along the same way
+        const keysB = nodeKeys.get(id2);
+        if(!keysB) continue;
+        let mergeable = false;
+        for(const k of keysA){ if(keysB.has(k) && onewayKeys.has(k)){ mergeable = true; break; } }
+        if(!mergeable) continue;
+        const xy2 = rawXY.get(id2);
+        if(Math.hypot(xy[0]-xy2[0], xy[1]-xy2[1]) <= cell) union(id, id2);
+      }
+    }
+  }
+
+  // Representative position of each cluster = centroid (the centreline).
+  const sumX = new Map(), sumY = new Map(), cnt = new Map();
+  for(const id of rawXY.keys()){
+    const r = find(id), xy = rawXY.get(id);
+    sumX.set(r, (sumX.get(r)||0)+xy[0]);
+    sumY.set(r, (sumY.get(r)||0)+xy[1]);
+    cnt.set(r, (cnt.get(r)||0)+1);
+  }
+  const nodes = new Map();
+  for(const r of cnt.keys()) nodes.set(r, [ sumX.get(r)/cnt.get(r), sumY.get(r)/cnt.get(r) ]);
+  const inBox = r => {
+    const xy = nodes.get(r);
+    if(!xy) return false;
+    const lng = proj.lng0 + xy[0]/proj.mlon, lat = proj.lat0 + xy[1]/proj.mlat;
+    return lng >= bb.west && lng <= bb.east && lat >= bb.south && lat <= bb.north;
+  };
+
+  const adj = new Map();
+  const link = (a,b) => { if(!adj.has(a)) adj.set(a,new Set()); adj.get(a).add(b); };
+  for(const w of ways){
+    let prev = null;
+    for(const n of w.nodes){
+      if(!rawXY.has(n)) continue;
+      const r = find(n);
+      if(prev !== null && r !== prev && nodes.has(prev) && nodes.has(r) && inBox(prev) && inBox(r)){ link(prev, r); link(r, prev); }
+      prev = r;
+    }
+  }
+  const degree = id => (adj.get(id) ? adj.get(id).size : 0);
+  const used = new Set();
+  const key = (a,b) => a+'_'+b;
+  const edges = [];
+
+  const walk = (start, first) => {
+    const ids = [start];
+    const coords = [nodes.get(start)];
+    let prev = start, cur = first, guard = 0;
+    used.add(key(start,first)); used.add(key(first,start));
+    while(guard++ < 200000){
+      ids.push(cur); coords.push(nodes.get(cur));
+      if(cur === start) break;
+      if(degree(cur) !== 2) break;
+      const nbrs = adj.get(cur);
+      let next;
+      for(const n of nbrs){ if(n !== prev){ next = n; break; } }
+      if(next === undefined) break;
+      used.add(key(cur,next)); used.add(key(next,cur));
+      prev = cur; cur = next;
+    }
+    return { ids, coords };
+  };
+
+  const push = (ids, coords) => {
+    if(ids.length < 2) return;
+    const cum = [0];
+    for(let i=1; i<coords.length; i++){
+      cum.push(cum[i-1] + Math.hypot(coords[i][0]-coords[i-1][0], coords[i][1]-coords[i-1][1]));
+    }
+    edges.push({ a:ids[0], b:ids[ids.length-1], ids, coords, cum, length:cum[cum.length-1] });
+  };
+
+  for(const a of adj.keys()){
+    if(degree(a) === 2) continue;
+    for(const b of adj.get(a)){ if(used.has(key(a,b))) continue; const w = walk(a,b); push(w.ids,w.coords); }
+  }
+  for(const a of adj.keys()){
+    if(degree(a) !== 2) continue;
+    for(const b of adj.get(a)){ if(used.has(key(a,b))) continue; const w = walk(a,b); push(w.ids,w.coords); }
+  }
+
+  const adjSim = new Map();
+  edges.forEach((e, ei) => {
+    if(!adjSim.has(e.a)) adjSim.set(e.a, []);
+    adjSim.get(e.a).push({ edgeIndex:ei, node:e.a });
+    if(!adjSim.has(e.b)) adjSim.set(e.b, []);
+    adjSim.get(e.b).push({ edgeIndex:ei, node:e.b });
+  });
+
+  return { edges, adjSim };
+}
+
+function pointAt(e, d){
+  d = Math.max(0, Math.min(e.length, d));
+  let lo = 0, hi = e.cum.length - 1;
+  while(lo < hi - 1){ const mid = (lo + hi) >> 1; if(e.cum[mid] <= d) lo = mid; else hi = mid; }
+  const span = (e.cum[hi] - e.cum[lo]) || 1;
+  const t = (d - e.cum[lo]) / span;
+  return [
+    e.coords[lo][0] + (e.coords[hi][0] - e.coords[lo][0]) * t,
+    e.coords[lo][1] + (e.coords[hi][1] - e.coords[lo][1]) * t,
+    lo
+  ];
+}
+
+function headingFrom(nodeId, edgeIndex){
+  const e = state.edges[edgeIndex];
+  let startIdx, step;
+  if(e.a === nodeId && e.b !== nodeId){ startIdx = 0; step = 1; }
+  else if(e.b === nodeId && e.a !== nodeId){ startIdx = e.coords.length - 1; step = -1; }
+  else { startIdx = 0; step = 1; }
+  const p0 = e.coords[startIdx];
+  let p1 = p0;
+  for(let i = startIdx + step; i >= 0 && i < e.coords.length; i += step){
+    if(Math.hypot(e.coords[i][0]-p0[0], e.coords[i][1]-p0[1]) > 0.01){ p1 = e.coords[i]; break; }
+  }
+  const dx = p1[0]-p0[0], dy = p1[1]-p0[1];
+  const L = Math.hypot(dx,dy) || 1;
+  return { x:dx/L, y:dy/L };
+}
+
+function norm(x,y){ const L = Math.hypot(x,y) || 1; return { x:x/L, y:y/L }; }
+
+function dirFor(edgeIndex, nodeId){
+  return state.edges[edgeIndex].a === nodeId;
+}
+
+function desiredVec(){
+  if(stick) return stick;
+  if(keyHeld) return keyHeld;
+  if(swipe && performance.now() < swipe.t) return { x:swipe.x, y:swipe.y };
+  return null;
+}
+
+// Direction Pac-Man is currently travelling (used for instant U-turns).
+function travelHeading(){
+  const e = state.edges[state.pac.edgeIndex];
+  const seg = pointAt(e, state.pac.dist)[2];
+  const p0 = e.coords[seg], p1 = e.coords[seg+1] || e.coords[seg];
+  let dx = p1[0]-p0[0], dy = p1[1]-p0[1];
+  if(!state.pac.forward){ dx = -dx; dy = -dy; }
+  return norm(dx,dy);
+}
+
+// Direction of travel on the edge we arrived along, right at that node.
+function arrivalHeadingAt(cameIndex, nodeId){
+  const e = state.edges[cameIndex];
+  if(e.b === nodeId){
+    const n = e.coords.length;
+    const a = e.coords[n-2] || e.coords[n-1], b = e.coords[n-1];
+    return norm(b[0]-a[0], b[1]-a[1]);
+  }
+  const a = e.coords[1] || e.coords[0], b = e.coords[0];
+  return norm(b[0]-a[0], b[1]-a[1]);
+}
+
+// Pick the next edge at a node. Returns null when Pac-Man must stop (wall).
+function chooseAtNode(nodeId, cameIndex){
+  const list = state.adjSim.get(nodeId) || [];
+  const cands = (cameIndex == null) ? list : list.filter(c => c.edgeIndex !== cameIndex);
+  if(!cands.length) return null;
+
+  const desired = desiredVec();
+  if(desired){
+    let best = null, bestDot = -2;
+    for(const c of cands){
+      const h = headingFrom(nodeId, c.edgeIndex);
+      const dot = h.x*desired.x + h.y*desired.y;
+      if(dot > bestDot){ bestDot = dot; best = c; }
+    }
+    if(bestDot >= TURN_DOT) return { edgeIndex:best.edgeIndex, forward: dirFor(best.edgeIndex, nodeId) };
+  }
+
+  // No matching turn: only roll on through a gentle bend, otherwise stop.
+  if(cameIndex != null){
+    const arr = arrivalHeadingAt(cameIndex, nodeId);
+    let best = null, bestDot = -2;
+    for(const c of cands){
+      const h = headingFrom(nodeId, c.edgeIndex);
+      const dot = h.x*arr.x + h.y*arr.y;
+      if(dot > bestDot){ bestDot = dot; best = c; }
+    }
+    if(bestDot >= CONTINUE_DOT) return { edgeIndex:best.edgeIndex, forward: dirFor(best.edgeIndex, nodeId) };
+  }
+  return null;
+}
+
+// ---------- pellets ----------
+function cellKey(x,y){ return Math.floor(x/CELL)+','+Math.floor(y/CELL); }
+
+function placePellets(){
+  state.pellets = [];
+  for(const e of state.edges){
+    for(let d = PELLET_SPACING*0.5; d < e.length - 1; d += PELLET_SPACING){
+      const p = pointAt(e, d);
+      state.pellets.push({ x:p[0], y:p[1], eaten:false });
+    }
+  }
+  state.grid = new Map();
+  state.pellets.forEach((p,i) => {
+    const k = cellKey(p.x,p.y);
+    if(!state.grid.has(k)) state.grid.set(k, []);
+    state.grid.get(k).push(i);
+  });
+}
+
+function eatAround(x,y){
+  const cx = Math.floor(x/CELL), cy = Math.floor(y/CELL);
+  for(let i=-1;i<=1;i++) for(let j=-1;j<=1;j++){
+    const arr = state.grid.get((cx+i)+','+(cy+j));
+    if(!arr) continue;
+    for(const idx of arr){
+      const p = state.pellets[idx];
+      if(p.eaten) continue;
+      if(Math.hypot(p.x-x, p.y-y) <= EAT_RADIUS){ p.eaten = true; state.score++; state.dirty = true; }
+    }
+  }
+}
+
+function spawnPac(){
+  let e = null;
+  for(let tries=0; tries<40 && !e; tries++){
+    const c = state.edges[(Math.random()*state.edges.length)|0];
+    if(c && c.length > PELLET_SPACING*3) e = c;
+  }
+  e = e || state.edges[0];
+  const ei = state.edges.indexOf(e);
+  state.pac = { edgeIndex:ei, dist: e.length*0.5, forward:true, waitNode:null };
+}
+
+function pacPos(){
+  const e = state.edges[state.pac.edgeIndex];
+  return pointAt(e, state.pac.dist);
+}
+
+// ---------- movement ----------
+function movePac(dt){
+  const pac = state.pac;
+  // instant U-turn: if the player points back the way we came, flip on the spot
+  if(pac.waitNode === null){
+    const d = desiredVec();
+    if(d){
+      const h = travelHeading();
+      if(h.x*d.x + h.y*d.y <= -0.6){
+        // dist is measured from coords[0], so flipping direction does NOT move us
+        pac.forward = !pac.forward;
+        if(swipe) swipe = null;
+      }
+    }
+  }
+
+  let remaining = SPEED * SPEED_FACTOR * dt;
+  let guard = 0;
+  while(remaining > 0 && guard++ < 24){
+    if(pac.waitNode !== null){
+      const move = chooseAtNode(pac.waitNode, null);
+      if(!move) break;
+      pac.waitNode = null;
+      pac.edgeIndex = move.edgeIndex;
+      pac.forward = move.forward;
+      pac.dist = move.forward ? 0 : state.edges[move.edgeIndex].length;
+      if(swipe) swipe = null;
+      continue;
+    }
+    const e = state.edges[pac.edgeIndex];
+    const toEnd = pac.forward ? e.length - pac.dist : pac.dist;
+    if(toEnd > 1e-6 && remaining < toEnd){
+      pac.dist += pac.forward ? remaining : -remaining;
+      remaining = 0;
+    } else {
+      remaining -= toEnd;
+      const endNode = pac.forward ? e.b : e.a;
+      pac.dist = pac.forward ? e.length : 0;
+      const move = chooseAtNode(endNode, pac.edgeIndex);
+      if(!move){ pac.waitNode = endNode; break; }   // hit a wall: stop and wait
+      pac.edgeIndex = move.edgeIndex;
+      pac.forward = move.forward;
+      pac.dist = move.forward ? 0 : state.edges[move.edgeIndex].length;
+      if(swipe) swipe = null;
+    }
+  }
+}
+
+// ---------- rendering ----------
+function buildRoadData(){
+  return { type:'FeatureCollection', features: state.edges.map(e => ({
+    type:'Feature', properties:{},
+    geometry:{ type:'LineString', coordinates: e.coords.map(c => toLngLat(c[0], c[1])) }
+  })) };
+}
+
+function renderPellets(force){
+  if(!state.dirty) return;
+  const now = performance.now();
+  if(!force && now - state.lastPellet < 90) return;
+  state.lastPellet = now; state.dirty = false;
+  const features = [];
+  for(const p of state.pellets){
+    if(p.eaten) continue;
+    features.push({ type:'Feature', properties:{},
+      geometry:{ type:'Point', coordinates: toLngLat(p.x, p.y) } });
+  }
+  const src = map.getSource('pellets');
+  if(src) src.setData({ type:'FeatureCollection', features });
+}
+
+function boundaryData(){
+  const bb = state.bb;
+  return { type:'Feature', properties:{}, geometry:{ type:'LineString', coordinates:[
+    [bb.west,bb.south],[bb.east,bb.south],[bb.east,bb.north],[bb.west,bb.north],[bb.west,bb.south]
+  ]}};
+}
+
+function addLayers(){
+  removeLayers();
+
+  map.addSource('bounds', { type:'geojson', data: boundaryData() });
+  map.addLayer({ id:'bounds', type:'line', source:'bounds',
+    paint:{ 'line-color':'#ff5252', 'line-width':2, 'line-dasharray':[2,2], 'line-opacity':0.85 } });
+
+  map.addSource('roads', { type:'geojson', data: buildRoadData() });
+  map.addLayer({ id:'roads', type:'line', source:'roads',
+    layout:{ 'line-cap':'round', 'line-join':'round' },
+    paint:{ 'line-color':'#ffd23f', 'line-width':3.5, 'line-opacity':0.5 } });
+
+  map.addSource('pellets', { type:'geojson', data:{ type:'FeatureCollection', features:[] } });
+  map.addLayer({ id:'pellets', type:'circle', source:'pellets',
+    paint:{ 'circle-radius':3, 'circle-color':'#ffffff',
+      'circle-stroke-color':'#000000aa', 'circle-stroke-width':0.8 } });
+
+  state.dirty = true;
+  renderPellets(true);
+}
+
+function removeLayers(){
+  for(const id of ['bounds','pellets','roads']){
+    if(map.getLayer(id)) map.removeLayer(id);
+    if(map.getSource(id)) map.removeSource(id);
+  }
+}
+
+function addPacMarker(){
+  const el = document.createElement('div');
+  el.className = 'pac-marker';
+  el.innerHTML = '<div class="pac-rot">' + PAC_SVG + '</div>';
+  state.rot = el.querySelector('.pac-rot');
+  state.marker = new maplibregl.Marker({ element: el, anchor:'center' }).setLngLat([0,0]).addTo(map);
+}
+
+function updatePacView(x, y){
+  const e = state.edges[state.pac.edgeIndex];
+  const seg = pointAt(e, state.pac.dist)[2];
+  const p0 = e.coords[seg], p1 = e.coords[seg+1] || e.coords[seg];
+  let dx = p1[0]-p0[0], dy = p1[1]-p0[1];
+  if(!state.pac.forward){ dx = -dx; dy = -dy; }
+  const deg = Math.atan2(-dy, dx) * 180/Math.PI;
+  if(state.rot) state.rot.style.transform = 'rotate(' + deg.toFixed(1) + 'deg)';
+  state.marker.setLngLat(toLngLat(x, y));
+}
+
+function updateHud(){ document.getElementById('score').textContent = 'Dots: ' + state.score; }
+
+// ---------- loop ----------
+function frame(now){
+  if(!state.running) return;
+  const dt = Math.min(0.05, (now - state.last)/1000 || 0);
+  state.last = now;
+  movePac(dt);
+  const [x,y] = pacPos();
+  eatAround(x,y);
+  updatePacView(x,y);
+  renderPellets(false);
+  updateHud();
+  requestAnimationFrame(frame);
+}
+
+// ---------- game lifecycle ----------
+function playBounds(){
+  const c = map.getCenter();
+  const dLat = PLAY_HALF/proj.mlat, dLon = PLAY_HALF/proj.mlon;
+  return { south:c.lat-dLat, north:c.lat+dLat, west:c.lng-dLon, east:c.lng+dLon };
+}
+
+// Lock every interactive camera gesture while playing so the view is truly fixed.
+function lockCamera(){
+  map.dragPan.disable();
+  map.boxZoom.disable();
+  map.doubleClickZoom.disable();
+  map.scrollZoom.disable();
+  map.touchZoomRotate.disable();
+  map.keyboard.disable();
+}
+function unlockCamera(){
+  map.dragPan.enable();
+  map.boxZoom.enable();
+  map.doubleClickZoom.enable();
+  map.scrollZoom.enable();
+  map.touchZoomRotate.enable();
+  map.touchZoomRotate.disableRotation();
+  map.keyboard.disable();   // arrows stay reserved for Pac-Man
+}
+
+async function startGame(){
+  const status = document.getElementById('status');
+  try{
+    setBusy(true);
+    const c = map.getCenter();
+    proj.lng0 = c.lng; proj.lat0 = c.lat;
+    proj.mlat = 111320; proj.mlon = 111320*Math.cos(proj.lat0*Math.PI/180);
+
+    const bb = playBounds();
+    state.bb = bb;
+    // fixed camera: fit the whole play area once, then never scroll during play
+    map.fitBounds([[bb.west, bb.south],[bb.east, bb.north]], { padding: 16, animate: false });
+
+    status.textContent = 'Loading roads...';
+    const osm = await fetchOverpass(bb);
+    const g = buildGraph(osm, bb);
+    if(g.edges.length < 5) throw new Error('Not enough connected roads here. Move to a city block and retry.');
+
+    state.edges = g.edges; state.adjSim = g.adjSim;
+    state.score = 0; state.pac = null;
+    placePellets();
+    spawnPac();
+
+    addLayers();
+    if(state.marker) state.marker.remove();
+    addPacMarker();
+
+    state.running = true;
+    lockCamera();
+    document.getElementById('panel').hidden = true;
+    document.getElementById('hud').hidden = false;
+    document.getElementById('stick').hidden = false;
+    updateHud();
+    const [x,y] = pacPos();
+    updatePacView(x,y);
+    state.last = performance.now();
+    requestAnimationFrame(frame);
+  }catch(e){
+    status.textContent = e.message;
+  }finally{
+    setBusy(false);
+  }
+}
+
+function stopGame(){
+  state.running = false;
+  unlockCamera();
+  document.getElementById('panel').hidden = false;
+  document.getElementById('hud').hidden = true;
+  document.getElementById('stick').hidden = true;
+  document.getElementById('status').textContent = 'Stopped. Start again whenever you like.';
+}
+
+function setBusy(on){
+  document.getElementById('start').disabled = on;
+  document.getElementById('start').textContent = on ? 'Loading...' : 'Start game here';
+}
+
+// ---------- geocoding ----------
+async function geocode(q){
+  const url = 'https://nominatim.openstreetmap.org/search?format=json&limit=1&q=' + encodeURIComponent(q);
+  const res = await fetch(url, { headers:{ 'Accept':'application/json' } });
+  const j = await res.json();
+  if(!j.length) throw new Error('Location not found');
+  return [ parseFloat(j[0].lon), parseFloat(j[0].lat) ];
+}
+
+// ---------- input ----------
+function doSwipe(v){ swipe = { x:v.x, y:v.y, t: performance.now() + 1500 }; }
+
+function bindStick(){
+  const base = document.getElementById('stick-base');
+  const knob = document.getElementById('stick-knob');
+  if(!base || !knob) return;
+  const R = 44;                     // knob travel in px
+  const DEAD = 0.16;                // ignore the very centre
+  let id = null;
+  const center = () => { const r = base.getBoundingClientRect(); return { x:r.left+r.width/2, y:r.top+r.height/2 }; };
+  const apply = e => {
+    const c = center();
+    const dx = e.clientX - c.x, dy = e.clientY - c.y;
+    const len = Math.hypot(dx, dy) || 1;
+    const travel = Math.min(len, R);
+    knob.style.transform = 'translate(' + (dx/len*travel).toFixed(1) + 'px,' + (dy/len*travel).toFixed(1) + 'px)';
+    if(len / R < DEAD){ stick = null; return; }
+    stick = { x: dx/len, y: -dy/len };   // screen down -> world north-up
+  };
+  base.addEventListener('pointerdown', e => {
+    e.preventDefault(); id = e.pointerId;
+    try { base.setPointerCapture(id); } catch(_){}
+    apply(e);
+  });
+  base.addEventListener('pointermove', e => { if(e.pointerId !== id) return; e.preventDefault(); apply(e); });
+  const end = e => {
+    if(id !== null && e.pointerId !== id) return;
+    id = null; stick = null; knob.style.transform = 'translate(0,0)';
+  };
+  base.addEventListener('pointerup', end);
+  base.addEventListener('pointercancel', end);
+  base.addEventListener('lostpointercapture', end);
+}
+
+function bindControls(){
+  const el = map.getContainer();
+  let start = null;
+  el.addEventListener('touchstart', e => {
+    if(!state.running) return;
+    const t = e.touches[0]; start = { x:t.clientX, y:t.clientY };
+  }, { passive:true });
+  el.addEventListener('touchmove', e => { if(start) e.preventDefault(); }, { passive:false });
+  el.addEventListener('touchend', e => {
+    if(!state.running || !start) return;
+    const t = e.changedTouches[0];
+    const dx = t.clientX - start.x, dy = t.clientY - start.y;
+    start = null;
+    if(Math.hypot(dx,dy) < 24) return;
+    doSwipe(Math.abs(dx) > Math.abs(dy) ? DRV[dx>0?'right':'left'] : DRV[dy>0?'down':'up']);
+  });
+
+  bindStick();
+
+  const keys = { ArrowUp:'up', ArrowDown:'down', ArrowLeft:'left', ArrowRight:'right',
+    w:'up', s:'down', a:'left', d:'right' };
+  addEventListener('keydown', e => {
+    const dir = keys[e.key] || keys[e.key.toLowerCase()];
+    if(dir && state.running){ e.preventDefault(); keyHeld = DRV[dir]; }
+  });
+  addEventListener('keyup', e => {
+    const dir = keys[e.key] || keys[e.key.toLowerCase()];
+    if(dir) keyHeld = null;
+  });
+}
+
+// ---------- UI wiring ----------
+function wireUI(){
+  const search = document.getElementById('search');
+  const status = document.getElementById('status');
+
+  const runSearch = async () => {
+    const q = search.value.trim();
+    if(!q) return;
+    status.textContent = 'Searching...';
+    try{
+      const ll = await geocode(q);
+      map.jumpTo({ center: ll, zoom: 16 });
+      status.textContent = 'Found it. Aim the map, then start.';
+    }catch(e){ status.textContent = e.message; }
+  };
+
+  document.getElementById('go').onclick = runSearch;
+  search.addEventListener('keydown', e => { if(e.key === 'Enter'){ e.preventDefault(); runSearch(); } });
+  document.getElementById('loc').onclick = () => {
+    if(!navigator.geolocation){ status.textContent = 'Geolocation not supported.'; return; }
+    status.textContent = 'Locating...';
+    navigator.geolocation.getCurrentPosition(
+      p => { map.jumpTo({ center:[p.coords.longitude, p.coords.latitude], zoom:16 }); status.textContent = 'Located. Aim the map, then start.'; },
+      () => { status.textContent = 'Location unavailable (needs https or permission).'; }
+    );
+  };
+  document.getElementById('start').onclick = startGame;
+  document.getElementById('menu').onclick = stopGame;
+}
+
+map.on('load', () => {
+  wireUI();
+  bindControls();
+  document.getElementById('status').textContent = 'Find a city, aim the map, then start.';
+});
+</script>
+</body>
+</html>
