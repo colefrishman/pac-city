@@ -157,7 +157,7 @@ function toXY(lng, lat){ return [ (lng-proj.lng0)*proj.mlon, (lat-proj.lat0)*pro
 function toLngLat(x, y){ return [ proj.lng0 + x/proj.mlon, proj.lat0 + y/proj.mlat ]; }
 
 const state = {
-  running:false, edges:[], adjSim:new Map(), pellets:[], grid:new Map(),
+  running:false, loading:false, edges:[], adjSim:new Map(), pellets:[], grid:new Map(),
   pac:null, score:0, last:0, dirty:false, lastPellet:0, marker:null, rot:null,
   boundary:new Set(), wrapMap:new Map()
 };
@@ -753,7 +753,7 @@ function addPreview(){
     paint:{ 'line-color':'#ffe14d', 'line-width':2.5, 'line-dasharray':[2,2], 'line-opacity':0.9 } });
 }
 function updatePreview(){
-  if(state.running) return;
+  if(state.running || state.loading) return;
   const s = map.getSource('preview');
   if(s) s.setData(previewData());
 }
@@ -896,18 +896,20 @@ function playBounds(){
 // instant when the view hasn't moved since. Debounced to avoid hammering Overpass.
 let prefetchTimer = null;
 function schedulePrefetch(){
-  if(state.running) return;
+  if(state.running || state.loading) return;
   clearTimeout(prefetchTimer);
-  prefetchTimer = setTimeout(() => { if(!state.running) fetchOverpass(playBounds()).catch(() => {}); }, 800);
+  prefetchTimer = setTimeout(() => { if(!state.running && !state.loading) fetchOverpass(playBounds()).catch(() => {}); }, 800);
 }
 
 // Lock every interactive camera gesture while playing so the view is truly fixed.
 function lockCamera(){
   map.dragPan.disable();
+  map.dragRotate.disable();
   map.boxZoom.disable();
   map.doubleClickZoom.disable();
   map.scrollZoom.disable();
   map.touchZoomRotate.disable();
+  if(map.touchPitch) map.touchPitch.disable();
   map.keyboard.disable();
 }
 function unlockCamera(){
@@ -924,6 +926,7 @@ async function startGame(){
   const status = document.getElementById('status');
   try{
     setBusy(true);
+    state.loading = true;
     clearTimeout(prefetchTimer);
     const c = map.getCenter();
     proj.lng0 = c.lng; proj.lat0 = c.lat;
@@ -933,6 +936,7 @@ async function startGame(){
     state.bb = bb;
     // fixed camera: fit the whole play area once, then never scroll during play
     map.fitBounds([[bb.west, bb.south],[bb.east, bb.north]], { padding: 16, animate: false });
+    lockCamera();   // freeze pan/zoom the moment Start is pressed
 
     status.textContent = 'Loading roads...';
     let secs = 0;
@@ -956,7 +960,6 @@ async function startGame(){
     addPacMarker();
 
     state.running = true;
-    lockCamera();
     document.getElementById('panel').hidden = true;
     document.getElementById('hud').hidden = false;
     document.getElementById('stick').hidden = false;
@@ -966,8 +969,10 @@ async function startGame(){
     state.last = performance.now();
     requestAnimationFrame(frame);
   }catch(e){
+    unlockCamera();
     status.textContent = e.message;
   }finally{
+    state.loading = false;
     setBusy(false);
   }
 }
