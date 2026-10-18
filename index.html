@@ -339,6 +339,46 @@ function pruneShortDeadEnds(minLen){
   state.adjSim = adjSim;
 }
 
+// Keep only the roads Pac-Man can actually reach from where he starts, so every
+// dot is collectable. Tunnels count as connections between their two mouths.
+function keepLargestComponent(){
+  const adj = state.adjSim;
+  const seen = new Set();
+  const comps = [];
+  const compOf = new Map();
+  for(const start of adj.keys()){
+    if(seen.has(start)) continue;
+    const comp = { nodes:new Set(), len:0 };
+    const stack = [start];
+    seen.add(start);
+    while(stack.length){
+      const n = stack.pop();
+      comp.nodes.add(n); compOf.set(n, comp);
+      for(const c of (adj.get(n)||[])){
+        const e = state.edges[c.edgeIndex];
+        const nb = (e.a === n) ? e.b : e.a;
+        if(!seen.has(nb)){ seen.add(nb); stack.push(nb); }
+      }
+      const w = state.wrapMap.get(n);
+      if(w && !seen.has(w.node)){ seen.add(w.node); stack.push(w.node); }
+    }
+    comps.push(comp);
+  }
+  if(comps.length <= 1) return;
+  for(const e of state.edges) compOf.get(e.a).len += e.length;
+  let main = comps[0];
+  for(const c of comps) if(c.len > main.len) main = c;
+  state.edges = state.edges.filter(e => main.nodes.has(e.a) && main.nodes.has(e.b));
+  const adjSim = new Map();
+  state.edges.forEach((e, ei) => {
+    if(!adjSim.has(e.a)) adjSim.set(e.a, []);
+    adjSim.get(e.a).push({ edgeIndex:ei, node:e.a });
+    if(!adjSim.has(e.b)) adjSim.set(e.b, []);
+    adjSim.get(e.b).push({ edgeIndex:ei, node:e.b });
+  });
+  state.adjSim = adjSim;
+}
+
 // Pair up roads that run past opposite edges of the play area so Pac-Man can
 // drive off one side and reappear on the other, like a Pac-Man tunnel.
 function buildWraps(bb){
@@ -637,14 +677,48 @@ function boundaryData(){
   ]}};
 }
 
+const PORTAL_SHAPES = ['circle','diamond','triangle','square'];
+
+// Small canvas-drawn icons so each tunnel mouth gets its own shape and size.
+function makePortalImage(shape){
+  const S = 16;
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = S*2;
+  const g = cv.getContext('2d');
+  g.scale(2,2);
+  const c = S/2, r = S/2 - 2;
+  g.fillStyle = 'rgba(88,225,255,0.28)';
+  g.strokeStyle = '#58e1ff';
+  g.lineWidth = 2;
+  g.beginPath();
+  if(shape === 'circle'){ g.arc(c, c, r, 0, Math.PI*2); }
+  else if(shape === 'diamond'){ g.moveTo(c, c-r); g.lineTo(c+r, c); g.lineTo(c, c+r); g.lineTo(c-r, c); g.closePath(); }
+  else if(shape === 'triangle'){ g.moveTo(c, c-r); g.lineTo(c+r*0.9, c+r*0.75); g.lineTo(c-r*0.9, c+r*0.75); g.closePath(); }
+  else { g.rect(c-r, c-r, 2*r, 2*r); }
+  g.fill(); g.stroke();
+  return g.getImageData(0, 0, S*2, S*2);
+}
+
+function nodeHash(n){
+  const s = String(n);
+  let h = 2166136261;
+  for(let i=0; i<s.length; i++){ h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return h >>> 0;
+}
+
 function portalData(){
   const seen = new Set(), features = [];
   for(const e of state.edges){
     for(const id of [e.a, e.b]){
       if(!state.wrapMap.has(id) || seen.has(id)) continue;
       seen.add(id);
+      const h = nodeHash(id);
       const xy = id === e.a ? e.coords[0] : e.coords[e.coords.length-1];
-      features.push({ type:'Feature', properties:{}, geometry:{ type:'Point', coordinates: toLngLat(xy[0], xy[1]) } });
+      features.push({
+        type:'Feature',
+        properties:{ icon:'portal-'+PORTAL_SHAPES[h % PORTAL_SHAPES.length], scale:0.7 + ((h>>>3) % 4) * 0.2 },
+        geometry:{ type:'Point', coordinates: toLngLat(xy[0], xy[1]) }
+      });
     }
   }
   return { type:'FeatureCollection', features };
@@ -662,10 +736,15 @@ function addLayers(){
     layout:{ 'line-cap':'round', 'line-join':'round' },
     paint:{ 'line-color':'#ffd23f', 'line-width':3.5, 'line-opacity':0.5 } });
 
+  for(const s of PORTAL_SHAPES){
+    const name = 'portal-'+s;
+    if(!(map.hasImage && map.hasImage(name))) map.addImage(name, makePortalImage(s));
+  }
   map.addSource('portals', { type:'geojson', data: portalData() });
-  map.addLayer({ id:'portals', type:'circle', source:'portals',
-    paint:{ 'circle-radius':7, 'circle-color':'#58e1ff', 'circle-opacity':0.25,
-      'circle-stroke-color':'#58e1ff', 'circle-stroke-width':2 } });
+  map.addLayer({ id:'portals', type:'symbol', source:'portals',
+    layout:{ 'icon-image':['get','icon'], 'icon-size':['get','scale'],
+      'icon-allow-overlap':true, 'icon-ignore-placement':true },
+    paint:{ 'icon-opacity':0.9 } });
 
   map.addSource('pellets', { type:'geojson', data:{ type:'FeatureCollection', features:[] } });
   map.addLayer({ id:'pellets', type:'circle', source:'pellets',
@@ -763,6 +842,7 @@ async function startGame(){
     state.edges = g.edges; state.adjSim = g.adjSim; state.boundary = g.boundary;
     buildWraps(bb);
     pruneShortDeadEnds(MIN_STUB);
+    keepLargestComponent();
     if(state.edges.length < 5) throw new Error('Not enough connected roads here. Move to a city block and retry.');
 
     state.score = 0; state.pac = null;
