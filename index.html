@@ -142,7 +142,7 @@ const CHARACTERS = [
     decoStatic:'', decoAnimated:'' },
   { id:'mspacman', name:'Ms. Pac-Man', kind:'pac',   body:'#ffd93b', stroke:'#cf9d00',
     decoStatic: MS_LIPS_OPEN + MS_PARTS, decoAnimated: MS_LIPS_ANIM + MS_PARTS },
-  { id:'boo',      name:'Boo',         kind:'ghost', body:'#eef0ff', stroke:'#b9a7ff',
+  { id:'boo',      name:'Boo',         kind:'ghost', body:'#7fe0a2', stroke:'#37a35f', pupil:'#233b6b',
     rotate:false }
 ];
 let chosenChar = 'pacman';
@@ -157,24 +157,22 @@ function pacSVG(ch, preview){
     (preview ? ch.decoStatic : ch.decoAnimated) + '</svg>';
 }
 
-// A friendly ghost: soft white, rosy cheeks, a warm smile and a little halo.
-// Drawn upright (never rotated) with a gentle bob.
+// A ghost in the classic four-ghost style: domed head, scalloped skirt, big
+// white eyes whose pupils look the way it's heading. Drawn upright (never
+// rotated) with the same gentle bob the arcade ghosts have. Boo is green to
+// show he's on your side.
 function ghostSVG(ch, preview){
   const content =
-    '<ellipse cx="0" cy="-1.04" rx="0.40" ry="0.10" fill="none" stroke="#ffd97a" stroke-width="0.12"/>' +
-    '<path d="M-0.85,0.72 L-0.85,-0.08 A0.85,0.85 0 0 1 0.85,-0.08 L0.85,0.72 ' +
-      'Q0.6375,0.34 0.425,0.72 Q0.2125,0.34 0,0.72 Q-0.2125,0.34 -0.425,0.72 Q-0.6375,0.34 -0.85,0.72 Z" ' +
+    '<path d="M-0.85,0.55 L-0.85,-0.15 A0.85,0.85 0 0 1 0.85,-0.15 L0.85,0.55 ' +
+      'Q0.6375,0.30 0.425,0.55 Q0.2125,0.30 0,0.55 Q-0.2125,0.30 -0.425,0.55 Q-0.6375,0.30 -0.85,0.55 Z" ' +
       'fill="'+ch.body+'" stroke="'+ch.stroke+'" stroke-width="0.06" stroke-linejoin="round"/>' +
-    '<ellipse cx="-0.27" cy="-0.30" rx="0.23" ry="0.29" fill="#ffffff"/>' +
-    '<ellipse cx="0.33" cy="-0.30" rx="0.23" ry="0.29" fill="#ffffff"/>' +
-    '<circle cx="-0.22" cy="-0.28" r="0.11" fill="#3b3560"/>' +
-    '<circle cx="0.39" cy="-0.28" r="0.11" fill="#3b3560"/>' +
-    '<ellipse cx="-0.52" cy="0.18" rx="0.14" ry="0.09" fill="#ff9fb2" opacity="0.75"/>' +
-    '<ellipse cx="0.60" cy="0.18" rx="0.14" ry="0.09" fill="#ff9fb2" opacity="0.75"/>' +
-    '<path d="M-0.16,0.22 Q0,0.46 0.20,0.22" stroke="#7a6aa8" stroke-width="0.07" fill="none" stroke-linecap="round"/>';
+    '<ellipse cx="-0.32" cy="-0.35" rx="0.26" ry="0.32" fill="#ffffff"/>' +
+    '<ellipse cx="0.32" cy="-0.35" rx="0.26" ry="0.32" fill="#ffffff"/>' +
+    '<g class="pupil"><circle cx="-0.32" cy="-0.33" r="0.13" fill="'+ch.pupil+'"/></g>' +
+    '<g class="pupil"><circle cx="0.32" cy="-0.33" r="0.13" fill="'+ch.pupil+'"/></g>';
   const wrap = preview ? content
-    : '<g>' + content + '<animateTransform attributeName="transform" type="translate" values="0,0;0,-0.09;0,0" dur="0.9s" repeatCount="indefinite"/></g>';
-  return '<svg viewBox="-1.3 -1.35 2.6 2.7" width="30" height="30">' + wrap + '</svg>';
+    : '<g>' + content + '<animateTransform attributeName="transform" type="translate" values="0,0;0,-0.08;0,0" dur="0.9s" repeatCount="indefinite"/></g>';
+  return '<svg viewBox="-1 -1.1 2 2" width="30" height="30">' + wrap + '</svg>';
 }
 function characterSVG(ch, preview){
   return ch.kind === 'ghost' ? ghostSVG(ch, preview) : pacSVG(ch, preview);
@@ -225,7 +223,7 @@ function toLngLat(x, y){ return [ proj.lng0 + x/proj.mlon, proj.lat0 + y/proj.ml
 
 const state = {
   running:false, loading:false, edges:[], adjSim:new Map(), pellets:[], grid:new Map(),
-  pac:null, score:0, last:0, dirty:false, lastPellet:0, marker:null, rot:null,
+  pac:null, score:0, last:0, dirty:false, lastPellet:0, marker:null, rot:null, pupils:[],
   boundary:new Set(), wrapMap:new Map()
 };
 let keyHeld = null;       // { x, y } from keyboard
@@ -968,6 +966,7 @@ function addPacMarker(){
   el.className = 'pac-marker';
   el.innerHTML = '<div class="pac-rot">' + characterSVG(characterById(chosenChar), false) + '</div>';
   state.rot = el.querySelector('.pac-rot');
+  state.pupils = el.querySelectorAll ? Array.from(el.querySelectorAll('.pupil')) : [];
   state.marker = new maplibregl.Marker({ element: el, anchor:'center' }).setLngLat([0,0]).addTo(map);
 }
 
@@ -984,6 +983,12 @@ function updatePacView(x, y){
       const deg = Math.atan2(-dy, dx) * 180/Math.PI;
       state.rot.style.transform = 'rotate(' + deg.toFixed(1) + 'deg)';
     }
+  }
+  if(state.pupils && state.pupils.length){
+    const len = Math.hypot(dx, dy) || 1;
+    const tx = (dx/len)*0.10, ty = (-dy/len)*0.10;   // screen y is inverted
+    const t = 'translate(' + tx.toFixed(3) + ',' + ty.toFixed(3) + ')';
+    for(const p of state.pupils) p.setAttribute('transform', t);
   }
   state.marker.setLngLat(toLngLat(x, y));
 }
