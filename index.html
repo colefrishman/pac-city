@@ -146,7 +146,7 @@ const CHARACTERS = [
     rotate:false },
   { id:'dottie',   name:'Dottie',      kind:'pellet',body:'#ffe98a', stroke:'#e0aa2c', pupil:'#5a4413',
     rotate:false },
-  { id:'pina',     name:'Piña',        kind:'fruit', body:'#f7c948', stroke:'#c58a1a',
+  { id:'chest',    name:'Chest',       kind:'chest', body:'#8a5a2b', stroke:'#5c3a17',
     rotate:false }
 ];
 let chosenChar = 'pacman';
@@ -178,8 +178,8 @@ function ghostSVG(ch, preview){
     : '<g>' + content + '<animateTransform attributeName="transform" type="translate" values="0,0;0,-0.08;0,0" dur="0.9s" repeatCount="indefinite"/></g>';
   return '<svg viewBox="-1 -1.1 2 2" width="30" height="30">' + wrap + '</svg>';
 }
-// Dottie is a big power-pellet with one friendly eye. Her eye looks where
-// she's heading (same trick as the ghosts) and she softly pulses.
+// Dottie is a big power-pellet with one small eye, sitting where Pac-Man's
+// eye sits. She softly pulses.
 function pelletSVG(ch, preview){
   const aura = preview
     ? '<circle r="0.9" fill="'+ch.body+'" opacity="0.22"/>'
@@ -188,36 +188,36 @@ function pelletSVG(ch, preview){
       '<animate attributeName="opacity" values="0.28;0.12;0.28" dur="1.1s" repeatCount="indefinite"/></circle>';
   return '<svg viewBox="-1.15 -1.15 2.3 2.3" width="30" height="30">' + aura +
     '<circle r="0.62" fill="'+ch.body+'" stroke="'+ch.stroke+'" stroke-width="0.06"/>' +
-    '<ellipse cx="-0.22" cy="-0.26" rx="0.13" ry="0.09" fill="#ffffff" opacity="0.6"/>' +
-    '<ellipse cx="0" cy="-0.02" rx="0.30" ry="0.34" fill="#ffffff" stroke="'+ch.stroke+'" stroke-width="0.045"/>' +
-    '<g class="pupil"><circle cx="0" cy="-0.02" r="0.16" fill="'+ch.pupil+'"/></g>' +
+    '<ellipse cx="-0.24" cy="-0.20" rx="0.12" ry="0.08" fill="#ffffff" opacity="0.55"/>' +
+    '<ellipse cx="0.26" cy="-0.55" rx="0.12" ry="0.15" fill="#ffffff"/>' +
+    '<circle cx="0.26" cy="-0.55" r="0.06" fill="'+ch.pupil+'"/>' +
     '</svg>';
 }
 
-// A fruit that never shows up in Pac-Man: a pineapple. Clipped cross-hatch
-// gives it its peel; a leafy crown sits on top.
-function fruitSVG(ch, preview){
-  let tex = '';
-  for(let k=-4;k<=4;k++){
-    const a = k*0.3, b = a+1.5;
-    tex += '<line x1="'+a+'" y1="-1.1" x2="'+b+'" y2="1.1" stroke="#d99b23" stroke-width="0.05" opacity="0.7" clip-path="url(#pinaBody)"/>';
-    tex += '<line x1="'+a+'" y1="1.1" x2="'+b+'" y2="-1.1" stroke="#d99b23" stroke-width="0.05" opacity="0.7" clip-path="url(#pinaBody)"/>';
-  }
+// A treasure chest with two eyes: wooden body, domed lid, brass rim and lock.
+function chestSVG(ch, preview){
+  const lid = '#a06a34', brass = '#e0b23c', brassDark = '#a97d1e';
   const content =
-    '<defs><clipPath id="pinaBody"><ellipse cx="0" cy="0.16" rx="0.62" ry="0.76"/></clipPath></defs>' +
-    '<path d="M0,-0.55 Q-0.34,-0.92 -0.28,-1.16 Q0.02,-0.88 0.04,-0.55 Z" fill="#4fae4a"/>' +
-    '<path d="M0.02,-0.55 Q-0.06,-1.00 0.03,-1.24 Q0.24,-0.92 0.16,-0.55 Z" fill="#5fc757"/>' +
-    '<path d="M0.03,-0.55 Q0.30,-0.92 0.34,-1.14 Q0.08,-0.86 0.02,-0.55 Z" fill="#4fae4a"/>' +
-    '<ellipse cx="0" cy="0.16" rx="0.62" ry="0.76" fill="'+ch.body+'" stroke="'+ch.stroke+'" stroke-width="0.06"/>' +
-    tex +
-    '<ellipse cx="-0.24" cy="-0.16" rx="0.14" ry="0.20" fill="#ffffff" opacity="0.28"/>';
-  return '<svg viewBox="-1 -1.4 2 2.4" width="30" height="30">' + content + '</svg>';
+    '<rect x="-0.80" y="-0.06" width="1.60" height="0.76" rx="0.06" fill="'+ch.body+'" stroke="'+ch.stroke+'" stroke-width="0.06"/>' +
+    '<path d="M-0.80,-0.06 L-0.80,-0.30 A0.80,0.30 0 0 1 0.80,-0.30 L0.80,-0.06 Z" fill="'+lid+'" stroke="'+ch.stroke+'" stroke-width="0.06" stroke-linejoin="round"/>' +
+    '<line x1="-0.78" y1="0.26" x2="0.78" y2="0.26" stroke="'+ch.stroke+'" stroke-width="0.04" opacity="0.45"/>' +
+    '<line x1="-0.78" y1="0.52" x2="0.78" y2="0.52" stroke="'+ch.stroke+'" stroke-width="0.04" opacity="0.45"/>' +
+    '<rect x="-0.84" y="-0.12" width="1.68" height="0.13" rx="0.03" fill="'+brass+'" stroke="'+brassDark+'" stroke-width="0.03"/>' +
+    '<rect x="-0.15" y="0.00" width="0.30" height="0.32" rx="0.05" fill="'+brass+'" stroke="'+brassDark+'" stroke-width="0.04"/>' +
+    '<circle cx="0" cy="0.12" r="0.05" fill="#3a2a08"/>' +
+    '<path d="M-0.032,0.14 L0.032,0.14 L0.022,0.25 L-0.022,0.25 Z" fill="#3a2a08"/>' +
+    '<ellipse cx="-0.30" cy="-0.38" rx="0.18" ry="0.20" fill="#ffffff"/>' +
+    '<ellipse cx="0.30" cy="-0.38" rx="0.18" ry="0.20" fill="#ffffff"/>' +
+    '<g class="pupil"><circle cx="-0.30" cy="-0.36" r="0.085" fill="#233b6b"/></g>' +
+    '<g class="pupil"><circle cx="0.30" cy="-0.36" r="0.085" fill="#233b6b"/></g>' +
+    '<ellipse cx="-0.36" cy="-0.50" rx="0.12" ry="0.06" fill="#ffffff" opacity="0.3"/>';
+  return '<svg viewBox="-1 -1 2 2" width="30" height="30">' + content + '</svg>';
 }
 
 function characterSVG(ch, preview){
   if(ch.kind === 'ghost')  return ghostSVG(ch, preview);
   if(ch.kind === 'pellet') return pelletSVG(ch, preview);
-  if(ch.kind === 'fruit')  return fruitSVG(ch, preview);
+  if(ch.kind === 'chest')  return chestSVG(ch, preview);
   return pacSVG(ch, preview);
 }
 
