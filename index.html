@@ -8,21 +8,28 @@
 <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet">
 <style>
   *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-  html,body{margin:0;height:100%;overflow:hidden;background:#0b0d12;
+  html,body{margin:0;height:100vh;height:100dvh;overflow:hidden;background:#0b0d12;
     font:15px/1.35 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
     -webkit-user-select:none;user-select:none;color:#111}
   #map{position:absolute;inset:0;touch-action:none}
 
   #panel{position:absolute;left:12px;right:12px;top:calc(12px + env(safe-area-inset-top));
     max-width:360px;margin:0 auto;background:#fff;border-radius:16px;padding:16px;
-    box-shadow:0 12px 40px #0007;z-index:6}
-  #panel h1{margin:0 0 2px;font-size:20px}
-  #panel .sub{margin:0 0 12px;color:#666;font-size:13px}
+    box-shadow:0 12px 40px #0007;z-index:6;
+    max-height:calc(100dvh - 24px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
+    overflow:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch}
+  #panel-head{display:flex;align-items:flex-start;gap:8px;justify-content:space-between}
+  #panel-head h1{margin:0 0 2px;font-size:20px}
+  #panel-head .sub{margin:0 0 12px;color:#666;font-size:13px}
+  #panel-toggle{flex:0 0 auto;width:36px;height:36px;min-height:0;padding:0;font-size:15px;line-height:1;
+    background:#f0f0f0;border:1px solid #ddd;border-radius:999px}
+  #panel.collapsed #panel-body,#panel.collapsed #panel-foot{display:none}
+  #panel.collapsed{padding-bottom:12px}
   #panel label{display:block;font-size:12px;color:#555;margin:0 0 8px}
-  #panel input{width:100%;margin-top:4px;padding:10px;border:1px solid #cfcfcf;border-radius:9px;font-size:15px}
+  #panel input{width:100%;margin-top:4px;padding:11px;border:1px solid #cfcfcf;border-radius:9px;font-size:16px}
   .row{display:flex;gap:8px;margin:2px 0 8px;flex-wrap:wrap}
   button{font:inherit;cursor:pointer;border:1px solid #cfcfcf;background:#f6f6f6;
-    padding:10px 12px;border-radius:9px;color:#111}
+    padding:12px;min-height:46px;border-radius:9px;color:#111}
   button.primary{width:100%;background:#ffe14d;border-color:#e6c400;font-weight:700;margin-top:4px}
   button:active{transform:translateY(1px)}
   #status{font-size:12.5px;color:#555;min-height:32px;margin:6px 0}
@@ -32,7 +39,8 @@
     display:flex;gap:8px;align-items:center}
   #score{background:#000000aa;color:#ffe14d;font-weight:800;padding:9px 14px;border-radius:999px;
     box-shadow:0 4px 16px #0006}
-  #menu{background:#000000aa;color:#fff;border:none;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+  #menu{background:#000000aa;color:#fff;border:none;min-height:0;padding:10px 14px;
+    backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
 
   #stick{position:absolute;right:calc(16px + env(safe-area-inset-right));
     bottom:calc(20px + env(safe-area-inset-bottom));z-index:4;opacity:.92;touch-action:none}
@@ -46,6 +54,15 @@
   .pac-marker{width:30px;height:30px;display:flex;align-items:center;justify-content:center;
     filter:drop-shadow(0 1px 2px #0009)}
   .pac-rot{will-change:transform;display:flex}
+
+  /* Phones: turn the card into a bottom sheet so the map (and level preview) stays visible. */
+  @media (max-width:640px){
+    #panel{left:8px;right:8px;top:auto;bottom:calc(8px + env(safe-area-inset-bottom));
+      max-width:560px;border-radius:18px;max-height:64dvh}
+    #hud{top:calc(10px + env(safe-area-inset-top))}
+    #stick-base{width:132px;height:132px}
+    #stick-knob{width:56px;height:56px}
+  }
   [hidden]{display:none!important}
 </style>
 </head>
@@ -53,19 +70,28 @@
 <div id="map"></div>
 
 <div id="panel">
-  <h1>Road Pac</h1>
-  <p class="sub">Pac-Man over real city streets.</p>
-  <label>City or address
-    <input id="search" type="text" placeholder="e.g. Greenwich Village, NYC" autocomplete="off">
-  </label>
-  <div class="row">
-    <button id="go">Search</button>
-    <button id="loc">Use my location</button>
+  <div id="panel-head">
+    <div>
+      <h1>Road Pac</h1>
+      <p class="sub">Pac-Man over real city streets.</p>
+    </div>
+    <button id="panel-toggle" title="Show or hide the search options" aria-label="Show or hide search options">&#9662;</button>
+  </div>
+  <div id="panel-body">
+    <label>City or address
+      <input id="search" type="text" placeholder="e.g. Greenwich Village, NYC" autocomplete="off">
+    </label>
+    <div class="row">
+      <button id="go">Search</button>
+      <button id="loc">Use my location</button>
+    </div>
   </div>
   <p id="status">Find a city, aim the map, then start.</p>
   <button id="start" class="primary">Start game here</button>
-  <small>Roads &copy; OpenStreetMap contributors via Overpass. Geocoding via Nominatim.
-    Geolocation needs https or localhost.</small>
+  <div id="panel-foot">
+    <small>The dashed box shows the level area. Pan the map to move it.
+      Roads &copy; OpenStreetMap contributors via Overpass. Geocoding via Nominatim.</small>
+  </div>
 </div>
 
 <div id="hud" hidden>
@@ -121,8 +147,9 @@ const map = new maplibregl.Map({
   dragRotate: false,
   pitchWithRotate: false,
   keyboard: false,
-  attributionControl: { compact: true }
+  attributionControl: false
 });
+map.addControl(new maplibregl.AttributionControl({ compact:true, customAttribution:'Roads &copy; OpenStreetMap contributors' }), 'top-right');
 map.touchZoomRotate.disableRotation();
 
 const proj = { lng0:0, lat0:0, mlon:1, mlat:111320 };
@@ -711,6 +738,29 @@ function boundaryData(){
   ]}};
 }
 
+// Live dashed box on the map showing where the level will be, so the player can
+// see (and aim) the play area before starting.
+function previewData(){
+  const bb = playBounds();
+  return { type:'Feature', properties:{}, geometry:{ type:'LineString', coordinates:[
+    [bb.west,bb.south],[bb.east,bb.south],[bb.east,bb.north],[bb.west,bb.north],[bb.west,bb.south]
+  ]}};
+}
+function addPreview(){
+  if(map.getSource('preview')) return;
+  map.addSource('preview', { type:'geojson', data: previewData() });
+  map.addLayer({ id:'preview', type:'line', source:'preview',
+    paint:{ 'line-color':'#ffe14d', 'line-width':2.5, 'line-dasharray':[2,2], 'line-opacity':0.9 } });
+}
+function updatePreview(){
+  if(state.running) return;
+  const s = map.getSource('preview');
+  if(s) s.setData(previewData());
+}
+function setPreviewVisible(v){
+  if(map.getLayer('preview')) map.setPaintProperty('preview', 'line-opacity', v ? 0.9 : 0);
+}
+
 const PORTAL_SHAPES = ['circle','diamond','triangle','square'];
 
 // Small canvas-drawn icons so each tunnel mouth gets its own shape and size.
@@ -901,6 +951,7 @@ async function startGame(){
     spawnPac();
 
     addLayers();
+    setPreviewVisible(false);
     if(state.marker) state.marker.remove();
     addPacMarker();
 
@@ -924,6 +975,8 @@ async function startGame(){
 function stopGame(){
   state.running = false;
   unlockCamera();
+  setPreviewVisible(true);
+  updatePreview();
   document.getElementById('panel').hidden = false;
   document.getElementById('hud').hidden = true;
   document.getElementById('stick').hidden = true;
@@ -1014,6 +1067,10 @@ function bindControls(){
 function wireUI(){
   const search = document.getElementById('search');
   const status = document.getElementById('status');
+  const panel = document.getElementById('panel');
+  const toggle = document.getElementById('panel-toggle');
+  const collapse = () => { panel.classList.add('collapsed'); toggle.innerHTML = '&#9656;'; };
+  const isPhone = () => matchMedia('(max-width:640px)').matches;
 
   const runSearch = async () => {
     const q = search.value.trim();
@@ -1022,7 +1079,8 @@ function wireUI(){
     try{
       const ll = await geocode(q);
       map.jumpTo({ center: ll, zoom: 16 });
-      status.textContent = 'Found it. Aim the map, then start.';
+      status.textContent = 'Found it. Aim the dashed box, then start.';
+      if(isPhone()) collapse();
     }catch(e){ status.textContent = e.message; }
   };
 
@@ -1032,18 +1090,30 @@ function wireUI(){
     if(!navigator.geolocation){ status.textContent = 'Geolocation not supported.'; return; }
     status.textContent = 'Locating...';
     navigator.geolocation.getCurrentPosition(
-      p => { map.jumpTo({ center:[p.coords.longitude, p.coords.latitude], zoom:16 }); status.textContent = 'Located. Aim the map, then start.'; },
+      p => {
+        map.jumpTo({ center:[p.coords.longitude, p.coords.latitude], zoom:16 });
+        status.textContent = 'Located. Aim the dashed box, then start.';
+        if(isPhone()) collapse();
+      },
       () => { status.textContent = 'Location unavailable (needs https or permission).'; }
     );
   };
   document.getElementById('start').onclick = startGame;
   document.getElementById('menu').onclick = stopGame;
+
+  toggle.onclick = () => {
+    const collapsed = panel.classList.toggle('collapsed');
+    toggle.innerHTML = collapsed ? '&#9656;' : '&#9662;';
+  };
+
+  status.textContent = 'Find a city, aim the map, then start.';
 }
 
 map.on('load', () => {
   wireUI();
   bindControls();
-  document.getElementById('status').textContent = 'Find a city, aim the map, then start.';
+  addPreview();
+  map.on('move', updatePreview);
   map.on('moveend', schedulePrefetch);
   schedulePrefetch();
 });
