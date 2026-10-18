@@ -95,6 +95,7 @@ const CELL = 24;              // spatial grid cell (metres)
 const CONTINUE_DOT = 0.25;    // cos(~75deg): auto-continue only through gentle bends
 const PLAY_HALF = 350;        // half-size of play area (metres)
 const MIN_STUB = 35;          // metres: dead-end stubs shorter than this are dropped
+const MAX_PAIR = 220;         // metres: opposite-edge roads up to this far apart form a tunnel
 const MERGE_DIST = 25;        // metres: dual carriageways closer than this merge into one
 const ROAD_TYPES = 'trunk|primary|secondary|tertiary|unclassified|residential';
 const OVERPASS = [
@@ -122,7 +123,8 @@ function toLngLat(x, y){ return [ proj.lng0 + x/proj.mlon, proj.lat0 + y/proj.ml
 
 const state = {
   running:false, edges:[], adjSim:new Map(), pellets:[], grid:new Map(),
-  pac:null, score:0, last:0, dirty:false, lastPellet:0, marker:null, rot:null
+  pac:null, score:0, last:0, dirty:false, lastPellet:0, marker:null, rot:null,
+  boundary:new Set(), wrapMap:new Map()
 };
 let keyHeld = null;       // { x, y } from keyboard
 let stick = null;         // { x, y } from the analog joystick
@@ -235,14 +237,20 @@ function buildGraph(osm, bb){
   };
 
   const adj = new Map();
+  const boundary = new Set();
   const link = (a,b) => { if(!adj.has(a)) adj.set(a,new Set()); adj.get(a).add(b); };
   for(const w of ways){
-    let prev = null;
+    let prev = null, prevInside = false;
     for(const n of w.nodes){
       if(!rawXY.has(n)) continue;
       const r = find(n);
-      if(prev !== null && r !== prev && nodes.has(prev) && nodes.has(r) && inBox(prev) && inBox(r)){ link(prev, r); link(r, prev); }
-      prev = r;
+      const inside = nodes.has(r) && inBox(r);
+      if(prev !== null){
+        if(prevInside && inside && r !== prev){ link(prev, r); link(r, prev); }
+        else if(prevInside && !inside){ boundary.add(prev); }   // road runs past the edge
+        else if(!prevInside && inside){ boundary.add(r); }
+      }
+      prev = r; prevInside = inside;
     }
   }
   const degree = id => (adj.get(id) ? adj.get(id).size : 0);
@@ -295,7 +303,7 @@ function buildGraph(osm, bb){
     adjSim.get(e.b).push({ edgeIndex:ei, node:e.b });
   });
 
-  return { edges, adjSim };
+  return { edges, adjSim, boundary };
 }
 
 // Drop very short dead-end roads so Pac-Man isn't stopped by tiny spurs. Runs
@@ -313,7 +321,10 @@ function pruneShortDeadEnds(minLen){
     }
     for(const e of edges){
       if(e.removed || e.length >= minLen) continue;
-      if((deg.get(e.a)||0) <= 1 || (deg.get(e.b)||0) <= 1){ e.removed = true; changed = true; }
+      const leafA = (deg.get(e.a)||0) <= 1, leafB = (deg.get(e.b)||0) <= 1;
+      if(!leafA && !leafB) continue;
+      const portal = (leafA && state.wrapMap.has(e.a)) || (leafB && state.wrapMap.has(e.b));
+      if(!portal){ e.removed = true; changed = true; }
     }
   }
   const kept = edges.filter(e => !e.removed);
@@ -326,6 +337,63 @@ function pruneShortDeadEnds(minLen){
   });
   state.edges = kept;
   state.adjSim = adjSim;
+}
+
+// Pair up roads that run past opposite edges of the play area so Pac-Man can
+// drive off one side and reappear on the other, like a Pac-Man tunnel.
+function buildWraps(bb){
+  const xw = (bb.west - proj.lng0)*proj.mlon, xe = (bb.east - proj.lng0)*proj.mlon;
+  const ys = (bb.south - proj.lat0)*proj.mlat, yn = (bb.north - proj.lat0)*proj.mlat;
+  const deg = new Map();
+  for(const e of state.edges){
+    deg.set(e.a, (deg.get(e.a)||0)+1);
+    deg.set(e.b, (deg.get(e.b)||0)+1);
+  }
+  const north = [], south = [], east = [], west = [];
+  const seen = new Set();
+  const consider = (id, pos) => {
+    if(seen.has(id) || !state.boundary.has(id) || (deg.get(id)||0) !== 1) return;
+    seen.add(id);
+    const [x,y] = pos;
+    const dn = yn - y, ds = y - ys, de = xe - x, dw = x - xw;
+    const m = Math.min(dn, ds, de, dw);
+    if(m === dn) north.push({ id, c:x });
+    else if(m === ds) south.push({ id, c:x });
+    else if(m === de) east.push({ id, c:y });
+    else west.push({ id, c:y });
+  };
+  for(const e of state.edges){
+    consider(e.a, e.coords[0]);
+    consider(e.b, e.coords[e.coords.length-1]);
+  }
+  const wrapMap = new Map();
+  const pair = (A, B) => {
+    const used = new Set();
+    for(const a of A){
+      let best = null, bd = MAX_PAIR;
+      for(const b of B){
+        if(used.has(b.id)) continue;
+        const d = Math.abs(a.c - b.c);
+        if(d < bd){ bd = d; best = b; }
+      }
+      if(best){ used.add(best.id); wrapMap.set(a.id, { node:best.id }); wrapMap.set(best.id, { node:a.id }); }
+    }
+  };
+  pair(north, south);
+  pair(east, west);
+  state.wrapMap = wrapMap;
+}
+
+// Edge leaving a node whose heading best matches dir (used when exiting a tunnel).
+function pickEdgeClosestTo(nodeId, dir){
+  const inc = state.adjSim.get(nodeId) || [];
+  let best = null, bestDot = -Infinity;
+  for(const c of inc){
+    const h = headingFrom(nodeId, c.edgeIndex);
+    const dot = h.x*dir.x + h.y*dir.y;
+    if(dot > bestDot){ bestDot = dot; best = c; }
+  }
+  return best ? { edgeIndex:best.edgeIndex, forward:dirFor(best.edgeIndex, nodeId) } : null;
 }
 
 function pointAt(e, d){
@@ -517,11 +585,24 @@ function movePac(dt){
       const endNode = pac.forward ? e.b : e.a;
       pac.dist = pac.forward ? e.length : 0;
       const move = chooseAtNode(endNode, pac.edgeIndex);
-      if(!move){ pac.waitNode = endNode; break; }   // hit a wall: stop and wait
-      pac.edgeIndex = move.edgeIndex;
-      pac.forward = move.forward;
-      pac.dist = move.forward ? 0 : state.edges[move.edgeIndex].length;
-      if(swipe) swipe = null;
+      if(move){
+        pac.edgeIndex = move.edgeIndex;
+        pac.forward = move.forward;
+        pac.dist = move.forward ? 0 : state.edges[move.edgeIndex].length;
+        if(swipe) swipe = null;
+      } else {
+        // No road onward: if this is a boundary tunnel, reappear on the far side.
+        const wrap = state.wrapMap.get(endNode);
+        const exit = wrap ? pickEdgeClosestTo(wrap.node, arrivalHeadingAt(pac.edgeIndex, endNode)) : null;
+        if(exit){
+          pac.edgeIndex = exit.edgeIndex;
+          pac.forward = exit.forward;
+          pac.dist = exit.forward ? 0 : state.edges[exit.edgeIndex].length;
+          if(swipe) swipe = null;
+        } else {
+          pac.waitNode = endNode; break;   // hit a wall: stop and wait
+        }
+      }
     }
   }
 }
@@ -556,6 +637,19 @@ function boundaryData(){
   ]}};
 }
 
+function portalData(){
+  const seen = new Set(), features = [];
+  for(const e of state.edges){
+    for(const id of [e.a, e.b]){
+      if(!state.wrapMap.has(id) || seen.has(id)) continue;
+      seen.add(id);
+      const xy = id === e.a ? e.coords[0] : e.coords[e.coords.length-1];
+      features.push({ type:'Feature', properties:{}, geometry:{ type:'Point', coordinates: toLngLat(xy[0], xy[1]) } });
+    }
+  }
+  return { type:'FeatureCollection', features };
+}
+
 function addLayers(){
   removeLayers();
 
@@ -568,6 +662,11 @@ function addLayers(){
     layout:{ 'line-cap':'round', 'line-join':'round' },
     paint:{ 'line-color':'#ffd23f', 'line-width':3.5, 'line-opacity':0.5 } });
 
+  map.addSource('portals', { type:'geojson', data: portalData() });
+  map.addLayer({ id:'portals', type:'circle', source:'portals',
+    paint:{ 'circle-radius':7, 'circle-color':'#58e1ff', 'circle-opacity':0.25,
+      'circle-stroke-color':'#58e1ff', 'circle-stroke-width':2 } });
+
   map.addSource('pellets', { type:'geojson', data:{ type:'FeatureCollection', features:[] } });
   map.addLayer({ id:'pellets', type:'circle', source:'pellets',
     paint:{ 'circle-radius':3, 'circle-color':'#ffffff',
@@ -578,7 +677,7 @@ function addLayers(){
 }
 
 function removeLayers(){
-  for(const id of ['bounds','pellets','roads']){
+  for(const id of ['bounds','roads','portals','pellets']){
     if(map.getLayer(id)) map.removeLayer(id);
     if(map.getSource(id)) map.removeSource(id);
   }
@@ -661,7 +760,8 @@ async function startGame(){
     status.textContent = 'Loading roads...';
     const osm = await fetchOverpass(bb);
     const g = buildGraph(osm, bb);
-    state.edges = g.edges; state.adjSim = g.adjSim;
+    state.edges = g.edges; state.adjSim = g.adjSim; state.boundary = g.boundary;
+    buildWraps(bb);
     pruneShortDeadEnds(MIN_STUB);
     if(state.edges.length < 5) throw new Error('Not enough connected roads here. Move to a city block and retry.');
 
