@@ -526,6 +526,23 @@ function pruneShortDeadEnds(minLen){
   state.adjSim = adjSim;
 }
 
+// A road too short to hold even one dot gives the player nothing to collect, so
+// cut it. Runs before tunnel pairing so any dead-ends it creates get cleaned up.
+function hasRoomForDot(e){ return e.length - 1 > PELLET_SPACING*0.5; }
+function clipDotlessEdges(){
+  const kept = state.edges.filter(hasRoomForDot);
+  if(kept.length === state.edges.length) return;
+  const adjSim = new Map();
+  kept.forEach((e, ei) => {
+    if(!adjSim.has(e.a)) adjSim.set(e.a, []);
+    adjSim.get(e.a).push({ edgeIndex:ei, node:e.a });
+    if(!adjSim.has(e.b)) adjSim.set(e.b, []);
+    adjSim.get(e.b).push({ edgeIndex:ei, node:e.b });
+  });
+  state.edges = kept;
+  state.adjSim = adjSim;
+}
+
 // Give every remaining dead-end a portal by pairing it with its nearest other
 // dead-end, so no road just stops at a wall. A lone leftover (or two ends of the
 // same road) can't pair and gets cut by pruneShortDeadEnds(Infinity) afterwards.
@@ -1139,6 +1156,7 @@ async function startGame(){
     try{ osm = await fetchOverpass(bb); } finally { clearInterval(ticker); }
     const g = buildGraph(osm, bb);
     state.edges = g.edges; state.adjSim = g.adjSim; state.boundary = g.boundary;
+    clipDotlessEdges();
     buildWraps(bb);
     pruneShortDeadEnds(MIN_STUB);
     wrapDeadEnds();
