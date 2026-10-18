@@ -372,7 +372,7 @@ function buildGraph(osm, bb){
 function pruneShortDeadEnds(minLen){
   const edges = state.edges;
   let changed = true, guard = 0;
-  while(changed && guard++ < 100){
+  while(changed && guard++ < 500){
     changed = false;
     const deg = new Map();
     for(const e of edges){
@@ -382,10 +382,9 @@ function pruneShortDeadEnds(minLen){
     }
     for(const e of edges){
       if(e.removed || e.length >= minLen) continue;
-      const leafA = (deg.get(e.a)||0) <= 1, leafB = (deg.get(e.b)||0) <= 1;
-      if(!leafA && !leafB) continue;
-      const portal = (leafA && state.wrapMap.has(e.a)) || (leafB && state.wrapMap.has(e.b));
-      if(!portal){ e.removed = true; changed = true; }
+      const deadA = (deg.get(e.a)||0) <= 1 && !state.wrapMap.has(e.a);
+      const deadB = (deg.get(e.b)||0) <= 1 && !state.wrapMap.has(e.b);
+      if(deadA || deadB){ e.removed = true; changed = true; }
     }
   }
   const kept = edges.filter(e => !e.removed);
@@ -398,6 +397,43 @@ function pruneShortDeadEnds(minLen){
   });
   state.edges = kept;
   state.adjSim = adjSim;
+}
+
+// Give every remaining dead-end a portal by pairing it with its nearest other
+// dead-end, so no road just stops at a wall. A lone leftover (or two ends of the
+// same road) can't pair and gets cut by pruneShortDeadEnds(Infinity) afterwards.
+function wrapDeadEnds(){
+  const deg = new Map(), pos = new Map();
+  const direct = new Set();
+  const pk = (a,b) => a <= b ? a+'_'+b : b+'_'+a;
+  for(const e of state.edges){
+    deg.set(e.a, (deg.get(e.a)||0)+1);
+    deg.set(e.b, (deg.get(e.b)||0)+1);
+    if(!pos.has(e.a)) pos.set(e.a, e.coords[0]);
+    if(!pos.has(e.b)) pos.set(e.b, e.coords[e.coords.length-1]);
+    direct.add(pk(e.a, e.b));
+  }
+  const leaves = [];
+  for(const [n,d] of deg){
+    if(d === 1 && !state.wrapMap.has(n) && pos.has(n)) leaves.push(n);
+  }
+  const used = new Set();
+  for(const a of leaves){
+    if(used.has(a)) continue;
+    const pa = pos.get(a);
+    let best = null, bd = Infinity;
+    for(const b of leaves){
+      if(b === a || used.has(b) || direct.has(pk(a,b))) continue;
+      const pb = pos.get(b);
+      const d = Math.hypot(pa[0]-pb[0], pa[1]-pb[1]);
+      if(d < bd){ bd = d; best = b; }
+    }
+    if(best !== null){
+      state.wrapMap.set(a, { node:best });
+      state.wrapMap.set(best, { node:a });
+      used.add(a); used.add(best);
+    }
+  }
 }
 
 // Keep only the roads Pac-Man can actually reach from where he starts, so every
@@ -961,6 +997,8 @@ async function startGame(){
     state.edges = g.edges; state.adjSim = g.adjSim; state.boundary = g.boundary;
     buildWraps(bb);
     pruneShortDeadEnds(MIN_STUB);
+    wrapDeadEnds();
+    pruneShortDeadEnds(Infinity);   // leftover dead-ends with no partner: cut them
     keepLargestComponent();
     if(state.edges.length < 5) throw new Error('Not enough connected roads here. Move to a city block and retry.');
 
