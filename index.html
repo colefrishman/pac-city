@@ -63,6 +63,14 @@
     filter:drop-shadow(0 1px 2px #0009)}
   .pac-rot{will-change:transform;display:flex}
 
+  #leveldone{position:absolute;inset:0;z-index:8;display:flex;align-items:center;justify-content:center;
+    padding:20px;background:#00000055;backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px)}
+  #leveldone .card{background:#fff;border-radius:18px;padding:22px 20px;width:min(340px,90vw);
+    text-align:center;box-shadow:0 20px 50px #0009}
+  #leveldone h2{margin:0 0 6px;font-size:22px}
+  #leveldone p{margin:0 0 16px;color:#666;font-size:13px}
+  #leveldone button{width:100%;margin-top:8px}
+
   /* Phones: turn the card into a bottom sheet so the map (and level preview) stays visible. */
   @media (max-width:640px){
     #panel{left:8px;right:8px;top:auto;bottom:calc(8px + env(safe-area-inset-bottom));
@@ -111,6 +119,15 @@
 
 <div id="stick" hidden>
   <div id="stick-base"><div id="stick-knob"></div></div>
+</div>
+
+<div id="leveldone" hidden>
+  <div class="card">
+    <h2 id="ld-title">Level cleared!</h2>
+    <p id="ld-stats"></p>
+    <button id="ld-next" class="primary">Next level</button>
+    <button id="ld-menu">Back to menu</button>
+  </div>
 </div>
 
 <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
@@ -221,8 +238,10 @@ function characterSVG(ch, preview){
   return pacSVG(ch, preview);
 }
 
-const SPEED = 62;             // metres / second
-const SPEED_FACTOR = 1;       // tune later for difficulty
+const SPEED = 62;             // metres / second, at level 1
+const SPEED_STEP = 0.12;      // each cleared level makes Pac-Man this much faster
+const MAX_SPEED_MULT = 2.2;   // cap so later levels stay playable
+function speedFactor(){ return Math.min(MAX_SPEED_MULT, 1 + (state.level - 1) * SPEED_STEP); }
 const PELLET_SPACING = 25;    // metres between dots
 const EAT_RADIUS = 9;         // metres
 const CELL = 24;              // spatial grid cell (metres)
@@ -266,7 +285,7 @@ function toLngLat(x, y){ return [ proj.lng0 + x/proj.mlon, proj.lat0 + y/proj.ml
 
 const state = {
   running:false, loading:false, edges:[], adjSim:new Map(), pellets:[], grid:new Map(),
-  pac:null, score:0, last:0, dirty:false, lastPellet:0, marker:null, rot:null, pupils:[],
+  pac:null, score:0, level:1, last:0, dirty:false, lastPellet:0, marker:null, rot:null, pupils:[],
   boundary:new Set(), wrapMap:new Map()
 };
 let keyHeld = null;       // { x, y } from keyboard
@@ -807,7 +826,7 @@ function movePac(dt){
     }
   }
 
-  let remaining = SPEED * SPEED_FACTOR * dt;
+  let remaining = SPEED * speedFactor() * dt;
   let guard = 0;
   while(remaining > 0 && guard++ < 24){
     if(pac.waitNode !== null){
@@ -1036,7 +1055,10 @@ function updatePacView(x, y){
   state.marker.setLngLat(toLngLat(x, y));
 }
 
-function updateHud(){ document.getElementById('score').textContent = 'Dots: ' + state.score; }
+function updateHud(){
+  document.getElementById('score').textContent =
+    'Lv ' + state.level + ' · ' + state.score + '/' + state.pellets.length;
+}
 
 // ---------- loop ----------
 function frame(now){
@@ -1049,6 +1071,7 @@ function frame(now){
   updatePacView(x,y);
   renderPellets(false);
   updateHud();
+  if(state.pellets.length && state.score >= state.pellets.length){ levelComplete(); return; }
   requestAnimationFrame(frame);
 }
 
@@ -1123,9 +1146,10 @@ async function startGame(){
     keepLargestComponent();
     if(state.edges.length < 5) throw new Error('Not enough connected roads here. Move to a city block and retry.');
 
-    state.score = 0; state.pac = null;
+    state.score = 0; state.level = 1; state.pac = null;
     placePellets();
     spawnPac();
+    document.getElementById('leveldone').hidden = true;
 
     addLayers();
     setPreviewVisible(false);
@@ -1158,7 +1182,37 @@ function stopGame(){
   document.getElementById('panel').hidden = false;
   document.getElementById('hud').hidden = true;
   document.getElementById('stick').hidden = true;
+  document.getElementById('leveldone').hidden = true;
   document.getElementById('status').textContent = 'Stopped. Start again whenever you like.';
+}
+
+// All dots eaten: freeze the game and show the level-complete card.
+function levelComplete(){
+  state.running = false;
+  document.getElementById('stick').hidden = true;
+  document.getElementById('hud').hidden = true;
+  document.getElementById('ld-title').textContent = 'Level ' + state.level + ' cleared!';
+  document.getElementById('ld-stats').textContent =
+    state.score + ' dots eaten · next level speed ×' + (1 + state.level*SPEED_STEP > MAX_SPEED_MULT
+      ? MAX_SPEED_MULT.toFixed(2) : (1 + state.level*SPEED_STEP).toFixed(2));
+  document.getElementById('leveldone').hidden = false;
+}
+
+// Deal a fresh set of dots on the same streets and speed things up a notch.
+function nextLevel(){
+  state.level++;
+  state.score = 0;
+  state.pac = null;
+  placePellets();
+  spawnPac();
+  renderPellets(true);
+  document.getElementById('leveldone').hidden = true;
+  document.getElementById('hud').hidden = false;
+  document.getElementById('stick').hidden = false;
+  updateHud();
+  state.running = true;
+  state.last = performance.now();
+  requestAnimationFrame(frame);
 }
 
 function setBusy(on){
@@ -1292,6 +1346,8 @@ function wireUI(){
   };
   document.getElementById('start').onclick = startGame;
   document.getElementById('menu').onclick = stopGame;
+  document.getElementById('ld-next').onclick = nextLevel;
+  document.getElementById('ld-menu').onclick = stopGame;
   buildCharSelector();
 
   toggle.onclick = () => {
