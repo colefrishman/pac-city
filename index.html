@@ -250,6 +250,8 @@ const PLAY_HALF = 350;        // half-size of play area (metres)
 const MIN_STUB = 35;          // metres: dead-end stubs shorter than this are dropped
 const MAX_PAIR = 220;         // metres: opposite-edge roads up to this far apart form a tunnel
 const MERGE_DIST = 25;        // metres: dual carriageways closer than this merge into one
+const PARALLEL_DOT = 0.97;    // cos(~14°): headings this close count as the same road
+const PERP_MAX = 0.8;         // side-by-side: offset must be mostly perpendicular to the road
 const ROAD_TYPES = 'trunk|primary|secondary|tertiary|unclassified|residential';
 const OVERPASS = [
   'https://overpass-api.de/api/interpreter',
@@ -350,17 +352,14 @@ function buildGraph(osm, bb){
 
   const ways = [];
   const nodeKeys = new Map();
-  const onewayKeys = new Set();
   const rawNeighbors = new Set();
   const pk = (a,b) => (a < b ? a+'_'+b : b+'_'+a);
   for(const el of osm.elements){
     if(el.type !== 'way') continue;
     const t = el.tags || {};
     const rkey = String(t.name || t.ref || '').trim();
-    const oneway = t.oneway === 'yes' || t.oneway === '1' || t.oneway === '-1' || t.junction === 'roundabout';
-    ways.push({ nodes: el.nodes, key: rkey, oneway });
+    ways.push({ nodes: el.nodes });
     if(rkey){
-      if(oneway) onewayKeys.add(rkey);
       for(const n of el.nodes){
         if(!nodeKeys.has(n)) nodeKeys.set(n, new Set());
         nodeKeys.get(n).add(rkey);
@@ -369,12 +368,52 @@ function buildGraph(osm, bb){
     for(let i=0; i+1<el.nodes.length; i++) rawNeighbors.add(pk(el.nodes[i], el.nodes[i+1]));
   }
 
+  // Heading of the road at each raw node (unit vectors to its neighbours), used
+  // to spot two roads running side by side.
+  const dirs = new Map();
+  const addDir = (n, dx, dy) => {
+    const L = Math.hypot(dx, dy); if(L < 1e-6) return;
+    if(!dirs.has(n)) dirs.set(n, []);
+    dirs.get(n).push({ x:dx/L, y:dy/L });
+  };
+  for(const w of ways){
+    for(let i=0; i+1<w.nodes.length; i++){
+      const A = rawXY.get(w.nodes[i]), B = rawXY.get(w.nodes[i+1]);
+      if(!A || !B) continue;
+      addDir(w.nodes[i], B[0]-A[0], B[1]-A[1]);
+      addDir(w.nodes[i+1], A[0]-B[0], A[1]-B[1]);
+    }
+  }
+
   // Union nearby nodes belonging to parallel one-way carriageways of the same
   // road, so divided roads / highways collapse to a single centreline.
   const parent = new Map();
   for(const id of rawXY.keys()) parent.set(id, id);
   const find = x => { let r = x; while(parent.get(r) !== r) r = parent.get(r); while(parent.get(x) !== r){ const nx = parent.get(x); parent.set(x, r); x = nx; } return r; };
   const union = (a,b) => { a = find(a); b = find(b); if(a !== b) parent.set(a, b); };
+
+  // Two nearby nodes belong to the same road if they share a name/ref, or if
+  // both are unnamed and their roads run near-collinear and side by side (the
+  // connecting offset is mostly perpendicular to that heading). This keeps
+  // genuinely different parallel streets apart while collapsing two lanes of a
+  // single road — even when it carries no name or oneway tag.
+  const sharesName = (a, b) => {
+    const ka = nodeKeys.get(a), kb = nodeKeys.get(b);
+    if(!ka || !kb) return false;
+    for(const k of ka){ if(kb.has(k)) return true; }
+    return false;
+  };
+  const bothUnnamed = (a, b) => !nodeKeys.has(a) && !nodeKeys.has(b);
+  const sideBySide = (a, b, dx, dy, dist) => {
+    const da = dirs.get(a), db = dirs.get(b);
+    if(!da || !db || dist < 1e-3) return false;
+    const ux = dx/dist, uy = dy/dist;
+    for(const p of da) for(const q of db){
+      if(p.x*q.x + p.y*q.y < PARALLEL_DOT) continue;   // headings run the same way
+      if(Math.abs(ux*p.x + uy*p.y) < PERP_MAX) return true;  // offset lies across them
+    }
+    return false;
+  };
 
   const cell = MERGE_DIST;
   const buckets = new Map();
@@ -386,8 +425,6 @@ function buildGraph(osm, bb){
     buckets.get(k).push(id);
   }
   for(const id of rawXY.keys()){
-    const keysA = nodeKeys.get(id);
-    if(!keysA) continue;
     const xy = rawXY.get(id);
     const cx = Math.floor(xy[0]/cell), cy = Math.floor(xy[1]/cell);
     for(let i=-1;i<=1;i++) for(let j=-1;j<=1;j++){
@@ -396,13 +433,11 @@ function buildGraph(osm, bb){
       for(const id2 of arr){
         if(id2 <= id) continue;
         if(rawNeighbors.has(pk(id, id2))) continue;        // never merge points along the same way
-        const keysB = nodeKeys.get(id2);
-        if(!keysB) continue;
-        let mergeable = false;
-        for(const k of keysA){ if(keysB.has(k) && onewayKeys.has(k)){ mergeable = true; break; } }
-        if(!mergeable) continue;
         const xy2 = rawXY.get(id2);
-        if(Math.hypot(xy[0]-xy2[0], xy[1]-xy2[1]) <= cell) union(id, id2);
+        const dx = xy2[0]-xy[0], dy = xy2[1]-xy[1];
+        const dist = Math.hypot(dx, dy);
+        if(dist > cell) continue;
+        if(sharesName(id, id2) || (bothUnnamed(id, id2) && sideBySide(id, id2, dx, dy, dist))) union(id, id2);
       }
     }
   }
