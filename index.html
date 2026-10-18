@@ -103,7 +103,15 @@ const OVERPASS = [
   'https://overpass.kumi.systems/api/interpreter',
   'https://maps.mail.ru/osm/tools/overpass/api/interpreter'
 ];
+const OVERPASS_TIMEOUT = 20000;   // abort an endpoint that hangs this long
+const OVERPASS_STAGGER = 2000;    // start each fallback endpoint this much later
 const DRV = { up:{x:0,y:1}, down:{x:0,y:-1}, left:{x:-1,y:0}, right:{x:1,y:0} };
+
+// Roads are cached per play-area box and shared by concurrent requests, so
+// panning around (prefetch) makes "Start" feel instant afterwards.
+const roadCache = new Map();
+const roadPending = new Map();
+function bboxKey(bb){ return [bb.south,bb.west,bb.north,bb.east].map(v => v.toFixed(5)).join(','); }
 
 const map = new maplibregl.Map({
   container: 'map',
@@ -132,23 +140,49 @@ let swipe = null;         // { x, y, t } from a swipe gesture
 
 // ---------- Overpass + graph ----------
 async function fetchOverpass(bb){
+  const key = bboxKey(bb);
+  if(roadCache.has(key)) return roadCache.get(key);
+  if(roadPending.has(key)) return roadPending.get(key);
+  const p = requestOverpass(bb).then(
+    data => { roadCache.set(key, data); roadPending.delete(key); return data; },
+    err  => { roadPending.delete(key); throw err; }
+  );
+  roadPending.set(key, p);
+  return p;
+}
+
+// Race the mirrors (staggered, so a healthy first mirror wins without load)
+// and abort whatever is still hanging so the player never waits on a dead one.
+async function requestOverpass(bb){
   const q = '[out:json][timeout:25];way["highway"~"^('+ROAD_TYPES+')"](' +
     bb.south+','+bb.west+','+bb.north+','+bb.east+');(._;>;);out body;';
-  let err;
-  for(const url of OVERPASS){
-    try{
-      const res = await fetch(url, {
+  const controllers = [];
+  let done = false;
+  const attempt = (url, delay) => new Promise((resolve, reject) => {
+    const ctrl = new AbortController();
+    controllers.push(ctrl);
+    setTimeout(() => {
+      if(done){ reject(new Error('skipped')); return; }
+      const timer = setTimeout(() => ctrl.abort(), OVERPASS_TIMEOUT);
+      fetch(url, {
         method:'POST',
         headers:{ 'Content-Type':'application/x-www-form-urlencoded' },
-        body:'data='+encodeURIComponent(q)
-      });
-      if(!res.ok) throw new Error('HTTP '+res.status);
-      const j = await res.json();
-      if(!j.elements || !j.elements.length) throw new Error('no roads returned');
-      return j;
-    }catch(e){ err = e; }
+        body:'data='+encodeURIComponent(q),
+        signal:ctrl.signal
+      })
+        .then(res => { if(!res.ok) throw new Error('HTTP '+res.status); return res.json(); })
+        .then(j => { clearTimeout(timer); if(!j.elements || !j.elements.length) throw new Error('no roads returned'); resolve(j); })
+        .catch(e => { clearTimeout(timer); reject(e); });
+    }, delay);
+  });
+  try{
+    return await Promise.any(OVERPASS.map((u,i) => attempt(u, i*OVERPASS_STAGGER)));
+  }catch(e){
+    throw new Error('Could not load roads - Overpass may be busy. Try again in a moment.');
+  }finally{
+    done = true;
+    for(const c of controllers) if(!c.signal.aborted) c.abort();
   }
-  throw new Error('Could not load roads ('+(err?err.message:'unknown')+')');
 }
 
 // Raw OSM nodes are dense shape points; collapse chains of degree-2 nodes into
@@ -798,10 +832,23 @@ function frame(now){
 }
 
 // ---------- game lifecycle ----------
+function boundsAround(lat, lng){
+  const mlat = 111320, mlon = 111320*Math.cos(lat*Math.PI/180);
+  const dLat = PLAY_HALF/mlat, dLon = PLAY_HALF/mlon;
+  return { south:lat-dLat, north:lat+dLat, west:lng-dLon, east:lng+dLon };
+}
 function playBounds(){
   const c = map.getCenter();
-  const dLat = PLAY_HALF/proj.mlat, dLon = PLAY_HALF/proj.mlon;
-  return { south:c.lat-dLat, north:c.lat+dLat, west:c.lng-dLon, east:c.lng+dLon };
+  return boundsAround(c.lat, c.lng);
+}
+
+// Quietly fetch the roads for wherever the map is aimed, so pressing Start is
+// instant when the view hasn't moved since. Debounced to avoid hammering Overpass.
+let prefetchTimer = null;
+function schedulePrefetch(){
+  if(state.running) return;
+  clearTimeout(prefetchTimer);
+  prefetchTimer = setTimeout(() => { if(!state.running) fetchOverpass(playBounds()).catch(() => {}); }, 800);
 }
 
 // Lock every interactive camera gesture while playing so the view is truly fixed.
@@ -827,6 +874,7 @@ async function startGame(){
   const status = document.getElementById('status');
   try{
     setBusy(true);
+    clearTimeout(prefetchTimer);
     const c = map.getCenter();
     proj.lng0 = c.lng; proj.lat0 = c.lat;
     proj.mlat = 111320; proj.mlon = 111320*Math.cos(proj.lat0*Math.PI/180);
@@ -837,7 +885,10 @@ async function startGame(){
     map.fitBounds([[bb.west, bb.south],[bb.east, bb.north]], { padding: 16, animate: false });
 
     status.textContent = 'Loading roads...';
-    const osm = await fetchOverpass(bb);
+    let secs = 0;
+    const ticker = setInterval(() => { status.textContent = 'Loading roads... ' + (++secs) + 's'; }, 1000);
+    let osm;
+    try{ osm = await fetchOverpass(bb); } finally { clearInterval(ticker); }
     const g = buildGraph(osm, bb);
     state.edges = g.edges; state.adjSim = g.adjSim; state.boundary = g.boundary;
     buildWraps(bb);
@@ -993,6 +1044,8 @@ map.on('load', () => {
   wireUI();
   bindControls();
   document.getElementById('status').textContent = 'Find a city, aim the map, then start.';
+  map.on('moveend', schedulePrefetch);
+  schedulePrefetch();
 });
 </script>
 </body>
