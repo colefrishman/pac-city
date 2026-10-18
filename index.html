@@ -94,6 +94,7 @@ const EAT_RADIUS = 9;         // metres
 const CELL = 24;              // spatial grid cell (metres)
 const CONTINUE_DOT = 0.25;    // cos(~75deg): auto-continue only through gentle bends
 const PLAY_HALF = 350;        // half-size of play area (metres)
+const MIN_STUB = 35;          // metres: dead-end stubs shorter than this are dropped
 const MERGE_DIST = 25;        // metres: dual carriageways closer than this merge into one
 const ROAD_TYPES = 'trunk|primary|secondary|tertiary|unclassified|residential';
 const OVERPASS = [
@@ -295,6 +296,36 @@ function buildGraph(osm, bb){
   });
 
   return { edges, adjSim };
+}
+
+// Drop very short dead-end roads so Pac-Man isn't stopped by tiny spurs. Runs
+// repeatedly, so a dead-end branch made of several short edges disappears too.
+function pruneShortDeadEnds(minLen){
+  const edges = state.edges;
+  let changed = true, guard = 0;
+  while(changed && guard++ < 100){
+    changed = false;
+    const deg = new Map();
+    for(const e of edges){
+      if(e.removed) continue;
+      deg.set(e.a, (deg.get(e.a)||0)+1);
+      deg.set(e.b, (deg.get(e.b)||0)+1);
+    }
+    for(const e of edges){
+      if(e.removed || e.length >= minLen) continue;
+      if((deg.get(e.a)||0) <= 1 || (deg.get(e.b)||0) <= 1){ e.removed = true; changed = true; }
+    }
+  }
+  const kept = edges.filter(e => !e.removed);
+  const adjSim = new Map();
+  kept.forEach((e, ei) => {
+    if(!adjSim.has(e.a)) adjSim.set(e.a, []);
+    adjSim.get(e.a).push({ edgeIndex:ei, node:e.a });
+    if(!adjSim.has(e.b)) adjSim.set(e.b, []);
+    adjSim.get(e.b).push({ edgeIndex:ei, node:e.b });
+  });
+  state.edges = kept;
+  state.adjSim = adjSim;
 }
 
 function pointAt(e, d){
@@ -630,9 +661,10 @@ async function startGame(){
     status.textContent = 'Loading roads...';
     const osm = await fetchOverpass(bb);
     const g = buildGraph(osm, bb);
-    if(g.edges.length < 5) throw new Error('Not enough connected roads here. Move to a city block and retry.');
-
     state.edges = g.edges; state.adjSim = g.adjSim;
+    pruneShortDeadEnds(MIN_STUB);
+    if(state.edges.length < 5) throw new Error('Not enough connected roads here. Move to a city block and retry.');
+
     state.score = 0; state.pac = null;
     placePellets();
     spawnPac();
