@@ -42,10 +42,15 @@
   .char.sel{border-color:#ffcf00;background:#fffbe6}
   .char svg{width:30px;height:30px;display:block}
   .char span{font-size:10px;color:#555;white-space:nowrap}
+  .diff{flex:0 0 auto;background:#fff;border:2px solid #e2e2e2;border-radius:12px;padding:10px 12px;
+    font-size:12px;color:#333;min-height:0}
+  .diff.sel{border-color:#ffcf00;background:#fffbe6;font-weight:700}
 
   #hud{position:absolute;left:12px;top:calc(12px + env(safe-area-inset-top));z-index:4;
     display:flex;gap:8px;align-items:center}
   #score{background:#000000aa;color:#ffe14d;font-weight:800;padding:9px 14px;border-radius:999px;
+    box-shadow:0 4px 16px #0006}
+  #lives{background:#000000aa;color:#ff8ad8;font-weight:800;padding:9px 14px;border-radius:999px;
     box-shadow:0 4px 16px #0006}
   #menu{background:#000000aa;color:#fff;border:none;min-height:0;padding:10px 14px;
     backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
@@ -103,6 +108,8 @@
     </div>
     <div class="charlabel">Character</div>
     <div id="chars" class="chars"></div>
+    <div class="charlabel">Ghosts</div>
+    <div id="diffs" class="chars"></div>
   </div>
   <p id="status">Find a city, aim the map, then start.</p>
   <button id="start" class="primary">Start game here</button>
@@ -114,6 +121,7 @@
 
 <div id="hud" hidden>
   <div id="score">Dots: 0</div>
+  <div id="lives" hidden>Lives 3</div>
   <button id="menu">Menu</button>
 </div>
 
@@ -245,6 +253,24 @@ function speedFactor(){ return Math.min(MAX_SPEED_MULT, 1 + (state.level - 1) * 
 const PELLET_SPACING = 25;    // metres between dots
 const EAT_RADIUS = 9;         // metres
 const CELL = 24;              // spatial grid cell (metres)
+const CATCH_RADIUS = 13;      // metres: a ghost this close to Pac-Man catches him
+const LIVES = 3;              // Pac-Man's spare lives when ghosts are on
+// Difficulty just decides how many ghosts roam and how fast they go. "Peaceful"
+// is the original, ghost-free game.
+const DIFFICULTIES = [
+  { id:'peaceful', name:'Peaceful', ghosts:0, speed:0 },
+  { id:'easy',     name:'Easy',     ghosts:1, speed:0.52 },
+  { id:'normal',   name:'Normal',   ghosts:2, speed:0.64 },
+  { id:'hard',     name:'Hard',     ghosts:4, speed:0.78 }
+];
+const GHOST_DEFS = [
+  { name:'Blinky', body:'#ff5252', stroke:'#bd3a3a' },
+  { name:'Pinky',  body:'#ff9fd6', stroke:'#cf6ba6' },
+  { name:'Inky',   body:'#58e1ff', stroke:'#2f9fc0' },
+  { name:'Clyde',  body:'#ffb852', stroke:'#cf8a25' }
+];
+let chosenDiff = 'peaceful';
+function difficultyById(id){ return DIFFICULTIES.find(d => d.id === id) || DIFFICULTIES[0]; }
 const CONTINUE_DOT = 0.25;    // cos(~75deg): auto-continue only through gentle bends
 const PLAY_HALF = 350;        // half-size of play area (metres)
 const MIN_STUB = 35;          // metres: dead-end stubs shorter than this are dropped
@@ -288,7 +314,9 @@ function toLngLat(x, y){ return [ proj.lng0 + x/proj.mlon, proj.lat0 + y/proj.ml
 const state = {
   running:false, loading:false, edges:[], adjSim:new Map(), pellets:[], grid:new Map(),
   pac:null, score:0, level:1, last:0, dirty:false, lastPellet:0, marker:null, rot:null, pupils:[],
-  boundary:new Set(), wrapMap:new Map()
+  boundary:new Set(), wrapMap:new Map(),
+  ghosts:[], nodePos:new Map(), difficulty:'peaceful', lives:LIVES, invuln:0,
+  ghostMode:'scatter', ghostModeTimer:4, overlayMode:'level'
 };
 let keyHeld = null;       // { x, y } from keyboard
 let stick = null;         // { x, y } from the analog joystick
@@ -862,6 +890,191 @@ function pacPos(){
   return pointAt(e, state.pac.dist);
 }
 
+// ---------- ghosts ----------
+function ghostPos(gh){ return pointAt(state.edges[gh.edgeIndex], gh.dist); }
+
+// Position of every graph node (endpoints of the polylines), for ghost targeting.
+function buildNodePos(){
+  const m = new Map();
+  for(const e of state.edges){
+    m.set(e.a, e.coords[0]);
+    m.set(e.b, e.coords[e.coords.length-1]);
+  }
+  state.nodePos = m;
+}
+
+function addGhostMarker(gh){
+  const el = document.createElement('div');
+  el.className = 'pac-marker';
+  el.innerHTML = '<div class="pac-rot">' + ghostSVG({ kind:'ghost', body:gh.body, stroke:gh.stroke, pupil:'#233b6b' }, false) + '</div>';
+  gh.pupils = el.querySelectorAll ? Array.from(el.querySelectorAll('.pupil')) : [];
+  gh.marker = new maplibregl.Marker({ element: el, anchor:'center' }).setLngLat([0,0]).addTo(map);
+}
+
+function clearGhosts(){
+  if(state.ghosts) for(const gh of state.ghosts){ if(gh.marker) gh.marker.remove(); }
+  state.ghosts = [];
+}
+
+// Drop the ghosts on edges well away from Pac-Man's spawn.
+function spawnGhosts(){
+  clearGhosts();
+  const diff = difficultyById(state.difficulty);
+  if(!diff.ghosts || !state.edges.length || !state.pac) return;
+  const p = pacPos();
+  const far = state.edges
+    .map((e, i) => ({ i, e }))
+    .filter(x => { const m = pointAt(x.e, x.e.length/2); return Math.hypot(m[0]-p[0], m[1]-p[1]) > 120; });
+  const pool = far.length ? far : state.edges.map((e,i) => ({ i, e }));
+  const corners = state.bb ? [
+    toXY(state.bb.west,  state.bb.north), toXY(state.bb.east, state.bb.north),
+    toXY(state.bb.east,  state.bb.south), toXY(state.bb.west, state.bb.south)
+  ] : [];
+  for(let k=0; k<diff.ghosts; k++){
+    const pick = pool[(Math.random()*pool.length)|0];
+    const def = GHOST_DEFS[k % GHOST_DEFS.length];
+    const gh = { edgeIndex:pick.i, dist:pick.e.length/2, forward:true, waitNode:null,
+      name:def.name, body:def.body, stroke:def.stroke, corner:corners[k % corners.length] || p };
+    state.ghosts.push(gh);
+    addGhostMarker(gh);
+  }
+}
+
+function ghostSpeed(){
+  const diff = difficultyById(state.difficulty);
+  if(!diff.ghosts) return 0;
+  return SPEED * diff.speed * Math.min(1.5, 1 + (state.level-1)*0.05);
+}
+
+// Where a ghost is heading right now: Pac-Man, a spot ahead of him, or a corner
+// when scattering. Each ghost has a slightly different personality.
+function ghostTarget(gh){
+  const p = pacPos();
+  if(state.ghostMode === 'scatter') return gh.corner || p;
+  const h = travelHeading();
+  if(gh.name === 'Pinky') return [ p[0]+h.x*70, p[1]+h.y*70 ];
+  if(gh.name === 'Inky'){ const g = ghostPos(gh); return [ 2*p[0]-g[0]+h.x*40, 2*p[1]-g[1]+h.y*40 ]; }
+  if(gh.name === 'Clyde'){
+    const g = ghostPos(gh);
+    return Math.hypot(g[0]-p[0], g[1]-p[1]) < 90 ? (gh.corner || p) : p;
+  }
+  return p;
+}
+
+// At a node, head down the road that gets closest to the target (never reversing).
+function ghostChoose(gh, nodeId, cameIndex){
+  const list = state.adjSim.get(nodeId) || [];
+  const t = ghostTarget(gh);
+  let best = null, bestD = Infinity;
+  for(const c of list){
+    if(c.edgeIndex === cameIndex) continue;
+    const e = state.edges[c.edgeIndex];
+    const nb = (e.a === nodeId) ? e.b : e.a;
+    const np = state.nodePos.get(nb) || e.coords[0];
+    const d = Math.hypot(np[0]-t[0], np[1]-t[1]);
+    if(d < bestD){ bestD = d; best = c; }
+  }
+  return best ? { edgeIndex:best.edgeIndex, forward:dirFor(best.edgeIndex, nodeId) } : null;
+}
+
+function moveGhost(gh, dt){
+  let remaining = ghostSpeed() * dt;
+  let guard = 0;
+  while(remaining > 0 && guard++ < 24){
+    if(gh.waitNode !== null){
+      const move = ghostChoose(gh, gh.waitNode, null);
+      if(!move) break;
+      gh.waitNode = null; gh.edgeIndex = move.edgeIndex; gh.forward = move.forward;
+      gh.dist = move.forward ? 0 : state.edges[move.edgeIndex].length;
+      continue;
+    }
+    const e = state.edges[gh.edgeIndex];
+    const toEnd = gh.forward ? e.length - gh.dist : gh.dist;
+    if(toEnd > 1e-6 && remaining < toEnd){
+      gh.dist += gh.forward ? remaining : -remaining;
+      remaining = 0;
+    } else {
+      remaining -= toEnd;
+      const endNode = gh.forward ? e.b : e.a;
+      gh.dist = gh.forward ? e.length : 0;
+      const move = ghostChoose(gh, endNode, gh.edgeIndex);
+      if(move){
+        gh.edgeIndex = move.edgeIndex; gh.forward = move.forward;
+        gh.dist = move.forward ? 0 : state.edges[move.edgeIndex].length;
+      } else {
+        const wrap = state.wrapMap.get(endNode);
+        const exit = wrap ? pickEdgeClosestTo(wrap.node, arrivalHeadingAt(gh.edgeIndex, endNode)) : null;
+        if(exit){
+          gh.edgeIndex = exit.edgeIndex; gh.forward = exit.forward;
+          gh.dist = exit.forward ? 0 : state.edges[exit.edgeIndex].length;
+        } else {
+          gh.waitNode = endNode; break;
+        }
+      }
+    }
+  }
+}
+
+function updateGhostView(gh){
+  const [x,y] = ghostPos(gh);
+  const e = state.edges[gh.edgeIndex];
+  const seg = pointAt(e, gh.dist)[2];
+  const p0 = e.coords[seg], p1 = e.coords[seg+1] || e.coords[seg];
+  let dx = p1[0]-p0[0], dy = p1[1]-p0[1];
+  if(!gh.forward){ dx = -dx; dy = -dy; }
+  if(gh.pupils && gh.pupils.length){
+    const L = Math.hypot(dx, dy) || 1;
+    const t = 'translate(' + ((dx/L)*0.10).toFixed(3) + ',' + ((-dy/L)*0.10).toFixed(3) + ')';
+    for(const p of gh.pupils) p.setAttribute('transform', t);
+  }
+  if(gh.marker) gh.marker.setLngLat(toLngLat(x, y));
+}
+
+function updateGhosts(dt){
+  if(!state.ghosts.length) return;
+  state.ghostModeTimer -= dt;
+  if(state.ghostModeTimer <= 0){
+    state.ghostMode = state.ghostMode === 'chase' ? 'scatter' : 'chase';
+    state.ghostModeTimer = state.ghostMode === 'chase' ? 8 : 5;
+  }
+  for(const gh of state.ghosts){ moveGhost(gh, dt); updateGhostView(gh); }
+}
+
+function ghostCaught(x, y){
+  for(const gh of state.ghosts){
+    const g = ghostPos(gh);
+    if(Math.hypot(g[0]-x, g[1]-y) <= CATCH_RADIUS) return true;
+  }
+  return false;
+}
+
+function respawnActors(){
+  spawnPac();
+  clearGhosts();
+  spawnGhosts();
+  state.invuln = 2;
+}
+
+// A ghost touched Pac-Man: lose a life and restart the round, or end the game.
+function caught(){
+  state.lives--;
+  updateHud();
+  if(state.lives <= 0){ showGameOver(); return; }
+  respawnActors();
+}
+
+function showGameOver(){
+  state.running = false;
+  state.overlayMode = 'caught';
+  document.getElementById('stick').hidden = true;
+  document.getElementById('hud').hidden = true;
+  document.getElementById('ld-title').textContent = 'Caught!';
+  document.getElementById('ld-stats').textContent =
+    'You reached level ' + state.level + ' with ' + state.score + ' dots eaten.';
+  document.getElementById('ld-next').textContent = 'Try again';
+  document.getElementById('leveldone').hidden = false;
+}
+
 // ---------- movement ----------
 function movePac(dt){
   const pac = state.pac;
@@ -1104,12 +1317,17 @@ function updatePacView(x, y){
     const t = 'translate(' + tx.toFixed(3) + ',' + ty.toFixed(3) + ')';
     for(const p of state.pupils) p.setAttribute('transform', t);
   }
-  state.marker.setLngLat(toLngLat(x, y));
+  if(state.marker) state.marker.setLngLat(toLngLat(x, y));
 }
 
 function updateHud(){
   document.getElementById('score').textContent =
     'Lv ' + state.level + ' · ' + state.score + '/' + state.pellets.length;
+  const lv = document.getElementById('lives');
+  if(lv){
+    if(difficultyById(state.difficulty).ghosts > 0){ lv.hidden = false; lv.textContent = 'Lives ' + state.lives; }
+    else lv.hidden = true;
+  }
 }
 
 // ---------- loop ----------
@@ -1118,8 +1336,14 @@ function frame(now){
   const dt = Math.min(0.05, (now - state.last)/1000 || 0);
   state.last = now;
   movePac(dt);
-  const [x,y] = pacPos();
+  let [x,y] = pacPos();
   eatAround(x,y);
+  updateGhosts(dt);
+  if(state.ghosts.length && state.invuln <= 0 && ghostCaught(x,y)){
+    caught();
+    if(!state.running) return;
+    [x,y] = pacPos();
+  }
   updatePacView(x,y);
   renderPellets(false);
   updateHud();
@@ -1200,7 +1424,10 @@ async function startGame(){
     if(state.edges.length < 5) throw new Error('Not enough connected roads here. Move to a city block and retry.');
 
     state.score = 0; state.level = 1; state.pac = null;
+    state.difficulty = chosenDiff;
+    state.lives = LIVES;
     placePellets();
+    buildNodePos();
     spawnPac();
     document.getElementById('leveldone').hidden = true;
 
@@ -1209,6 +1436,9 @@ async function startGame(){
     if(state.marker) state.marker.remove();
     addPacMarker();
 
+    state.ghostMode = 'scatter'; state.ghostModeTimer = 4; state.invuln = 1.5;
+    spawnGhosts();
+
     state.running = true;
     document.getElementById('panel').hidden = true;
     document.getElementById('hud').hidden = false;
@@ -1216,6 +1446,7 @@ async function startGame(){
     updateHud();
     const [x,y] = pacPos();
     updatePacView(x,y);
+    for(const gh of state.ghosts) updateGhostView(gh);
     state.last = performance.now();
     requestAnimationFrame(frame);
   }catch(e){
@@ -1232,6 +1463,7 @@ function stopGame(){
   unlockCamera();
   setPreviewVisible(true);
   updatePreview();
+  clearGhosts();
   document.getElementById('panel').hidden = false;
   document.getElementById('hud').hidden = true;
   document.getElementById('stick').hidden = true;
@@ -1242,31 +1474,42 @@ function stopGame(){
 // All dots eaten: freeze the game and show the level-complete card.
 function levelComplete(){
   state.running = false;
+  state.overlayMode = 'level';
   document.getElementById('stick').hidden = true;
   document.getElementById('hud').hidden = true;
   document.getElementById('ld-title').textContent = 'Level ' + state.level + ' cleared!';
+  document.getElementById('ld-next').textContent = 'Next level';
   document.getElementById('ld-stats').textContent =
     state.score + ' dots eaten · next level speed ×' + (1 + state.level*SPEED_STEP > MAX_SPEED_MULT
       ? MAX_SPEED_MULT.toFixed(2) : (1 + state.level*SPEED_STEP).toFixed(2));
   document.getElementById('leveldone').hidden = false;
 }
 
-// Deal a fresh set of dots on the same streets and speed things up a notch.
-function nextLevel(){
-  state.level++;
+// Deal a fresh set of dots on the same streets, reset Pac-Man and the ghosts.
+function beginRound(){
   state.score = 0;
   state.pac = null;
   placePellets();
   spawnPac();
   renderPellets(true);
+  state.ghostMode = 'scatter'; state.ghostModeTimer = 4; state.invuln = 1.5;
+  spawnGhosts();
   document.getElementById('leveldone').hidden = true;
   document.getElementById('hud').hidden = false;
   document.getElementById('stick').hidden = false;
   updateHud();
+  const [x,y] = pacPos();
+  updatePacView(x,y);
+  for(const gh of state.ghosts) updateGhostView(gh);
   state.running = true;
   state.last = performance.now();
   requestAnimationFrame(frame);
 }
+
+// Same streets, one level higher (and a touch faster).
+function nextLevel(){ state.level++; beginRound(); }
+// After being caught out: fresh lives on the same level.
+function retryLevel(){ state.lives = LIVES; beginRound(); }
 
 function setBusy(on){
   document.getElementById('start').disabled = on;
@@ -1363,6 +1606,20 @@ function buildCharSelector(){
   }
 }
 
+function buildDiffSelector(){
+  const box = document.getElementById('diffs');
+  if(!box) return;
+  box.innerHTML = '';
+  for(const d of DIFFICULTIES){
+    const b = document.createElement('button');
+    b.className = 'diff' + (d.id === chosenDiff ? ' sel' : '');
+    b.textContent = d.name;
+    b.title = d.ghosts ? d.ghosts + ' ghost' + (d.ghosts > 1 ? 's' : '') : 'No ghosts';
+    b.onclick = () => { chosenDiff = d.id; buildDiffSelector(); };
+    box.appendChild(b);
+  }
+}
+
 function wireUI(){
   const search = document.getElementById('search');
   const status = document.getElementById('status');
@@ -1399,9 +1656,12 @@ function wireUI(){
   };
   document.getElementById('start').onclick = startGame;
   document.getElementById('menu').onclick = stopGame;
-  document.getElementById('ld-next').onclick = nextLevel;
+  document.getElementById('ld-next').onclick = () => {
+    if(state.overlayMode === 'caught') retryLevel(); else nextLevel();
+  };
   document.getElementById('ld-menu').onclick = stopGame;
   buildCharSelector();
+  buildDiffSelector();
 
   toggle.onclick = () => {
     const collapsed = panel.classList.toggle('collapsed');
