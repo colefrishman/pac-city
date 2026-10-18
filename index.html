@@ -92,7 +92,6 @@ const SPEED_FACTOR = 1;       // tune later for difficulty
 const PELLET_SPACING = 25;    // metres between dots
 const EAT_RADIUS = 9;         // metres
 const CELL = 24;              // spatial grid cell (metres)
-const TURN_DOT = 0.5;         // cos(~60deg): how close a swipe must match a road
 const CONTINUE_DOT = 0.25;    // cos(~75deg): auto-continue only through gentle bends
 const PLAY_HALF = 350;        // half-size of play area (metres)
 const MERGE_DIST = 25;        // metres: dual carriageways closer than this merge into one
@@ -368,21 +367,28 @@ function chooseAtNode(nodeId, cameIndex){
   const cands = (cameIndex == null) ? list : list.filter(c => c.edgeIndex !== cameIndex);
   if(!cands.length) return null;
 
+  const arr = (cameIndex != null) ? arrivalHeadingAt(cameIndex, nodeId) : null;
   const desired = desiredVec();
+
+  // Held direction: take whichever road is closest in angle. Ties (e.g. an exact
+  // diagonal between two roads) prefer the straighter option to keep momentum.
   if(desired){
-    let best = null, bestDot = -2;
+    let best = null, bestDot = -Infinity, bestAlign = -Infinity;
     for(const c of cands){
       const h = headingFrom(nodeId, c.edgeIndex);
       const dot = h.x*desired.x + h.y*desired.y;
-      if(dot > bestDot){ bestDot = dot; best = c; }
+      const align = arr ? (h.x*arr.x + h.y*arr.y) : 0;
+      if(dot > bestDot + 1e-6 || (Math.abs(dot - bestDot) <= 1e-6 && align > bestAlign)){
+        bestDot = dot; bestAlign = align; best = c;
+      }
     }
-    if(bestDot >= TURN_DOT) return { edgeIndex:best.edgeIndex, forward: dirFor(best.edgeIndex, nodeId) };
+    // Only ignore the held direction if every road here points against it.
+    if(bestDot > 0) return { edgeIndex:best.edgeIndex, forward: dirFor(best.edgeIndex, nodeId) };
   }
 
-  // No matching turn: only roll on through a gentle bend, otherwise stop.
-  if(cameIndex != null){
-    const arr = arrivalHeadingAt(cameIndex, nodeId);
-    let best = null, bestDot = -2;
+  // No usable held direction: roll through gentle bends, otherwise stop.
+  if(arr){
+    let best = null, bestDot = -Infinity;
     for(const c of cands){
       const h = headingFrom(nodeId, c.edgeIndex);
       const dot = h.x*arr.x + h.y*arr.y;
