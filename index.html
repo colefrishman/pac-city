@@ -35,6 +35,14 @@
   #status{font-size:12.5px;color:#555;min-height:32px;margin:6px 0}
   #panel small{display:block;color:#8a8a8a;font-size:11px;margin-top:10px;line-height:1.4}
 
+  .charlabel{font-size:12px;color:#555;margin:2px 0 4px}
+  .chars{display:flex;gap:8px;overflow-x:auto;padding:2px 0 6px;-webkit-overflow-scrolling:touch}
+  .char{flex:0 0 auto;display:flex;flex-direction:column;align-items:center;gap:3px;
+    background:#fff;border:2px solid #e2e2e2;border-radius:12px;padding:6px 10px;min-height:0}
+  .char.sel{border-color:#ffcf00;background:#fffbe6}
+  .char svg{width:30px;height:30px;display:block}
+  .char span{font-size:10px;color:#555;white-space:nowrap}
+
   #hud{position:absolute;left:12px;top:calc(12px + env(safe-area-inset-top));z-index:4;
     display:flex;gap:8px;align-items:center}
   #score{background:#000000aa;color:#ffe14d;font-weight:800;padding:9px 14px;border-radius:999px;
@@ -85,6 +93,8 @@
       <button id="go">Search</button>
       <button id="loc">Use my location</button>
     </div>
+    <div class="charlabel">Character</div>
+    <div id="chars" class="chars"></div>
   </div>
   <p id="status">Find a city, aim the map, then start.</p>
   <button id="start" class="primary">Start game here</button>
@@ -105,13 +115,38 @@
 
 <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
 <script>
-const PAC_SVG =
-  '<svg viewBox="-1.15 -1.15 2.3 2.3" width="30" height="30">' +
-  '<path fill="#ffe14d" stroke="#caa400" stroke-width="0.05">' +
-  '<animate attributeName="d" dur="0.3s" repeatCount="indefinite" calcMode="linear" values="' +
+const MOUTH_VALUES =
   'M0,0 L1,-0.02 A1,1 0 1 0 1,0.02 Z;' +
   'M0,0 L0.62,-0.78 A1,1 0 1 0 0.62,0.78 Z;' +
-  'M0,0 L1,-0.02 A1,1 0 1 0 1,0.02 Z"/></path></svg>';
+  'M0,0 L1,-0.02 A1,1 0 1 0 1,0.02 Z';
+
+const MS_DECO =
+  '<circle cx="0.26" cy="-0.55" r="0.12" fill="#1a1a1a"/>' +
+  '<path d="M0.14,-0.70 L0.04,-0.86 M0.36,-0.68 L0.42,-0.86" stroke="#1a1a1a" stroke-width="0.07" fill="none" stroke-linecap="round"/>' +
+  '<path d="M0.84,0.02 q0.10,0.12 -0.02,0.22" stroke="#e23b3b" stroke-width="0.12" fill="none" stroke-linecap="round"/>' +
+  '<circle cx="0.46" cy="0.34" r="0.05" fill="#7a5200"/>' +
+  '<path d="M-0.02,-0.98 L-0.34,-1.12 L-0.26,-0.82 Z" fill="#e23b3b"/>' +
+  '<path d="M-0.02,-0.98 L0.30,-1.12 L0.22,-0.82 Z" fill="#e23b3b"/>' +
+  '<circle cx="-0.02" cy="-0.98" r="0.09" fill="#c62f2f"/>';
+
+const CHARACTERS = [
+  { id:'pacman',   name:'Pac-Man',     body:'#ffe14d', stroke:'#caa400', deco:'' },
+  { id:'mspacman', name:'Ms. Pac-Man', body:'#ffd93b', stroke:'#cf9d00', deco:MS_DECO }
+];
+let chosenChar = 'pacman';
+function characterById(id){ return CHARACTERS.find(c => c.id === id) || CHARACTERS[0]; }
+
+function pacSVG(ch){
+  return '<svg viewBox="-1.15 -1.15 2.3 2.3" width="30" height="30">' +
+    '<path fill="'+ch.body+'" stroke="'+ch.stroke+'" stroke-width="0.05">' +
+    '<animate attributeName="d" dur="0.3s" repeatCount="indefinite" calcMode="linear" values="'+MOUTH_VALUES+'"/></path>' +
+    ch.deco + '</svg>';
+}
+function pacPreview(ch){
+  return '<svg viewBox="-1.15 -1.35 2.3 2.5" width="30" height="30">' +
+    '<path fill="'+ch.body+'" stroke="'+ch.stroke+'" stroke-width="0.05" d="M0,0 L0.62,-0.78 A1,1 0 1 0 0.62,0.78 Z"/>' +
+    ch.deco + '</svg>';
+}
 
 const SPEED = 62;             // metres / second
 const SPEED_FACTOR = 1;       // tune later for difficulty
@@ -899,7 +934,7 @@ function removeLayers(){
 function addPacMarker(){
   const el = document.createElement('div');
   el.className = 'pac-marker';
-  el.innerHTML = '<div class="pac-rot">' + PAC_SVG + '</div>';
+  el.innerHTML = '<div class="pac-rot">' + pacSVG(characterById(chosenChar)) + '</div>';
   state.rot = el.querySelector('.pac-rot');
   state.marker = new maplibregl.Marker({ element: el, anchor:'center' }).setLngLat([0,0]).addTo(map);
 }
@@ -1121,6 +1156,20 @@ function bindControls(){
 }
 
 // ---------- UI wiring ----------
+function buildCharSelector(){
+  const box = document.getElementById('chars');
+  if(!box) return;
+  box.innerHTML = '';
+  for(const c of CHARACTERS){
+    const b = document.createElement('button');
+    b.className = 'char' + (c.id === chosenChar ? ' sel' : '');
+    b.title = c.name;
+    b.innerHTML = pacPreview(c) + '<span>' + c.name + '</span>';
+    b.onclick = () => { chosenChar = c.id; buildCharSelector(); };
+    box.appendChild(b);
+  }
+}
+
 function wireUI(){
   const search = document.getElementById('search');
   const status = document.getElementById('status');
@@ -1157,6 +1206,7 @@ function wireUI(){
   };
   document.getElementById('start').onclick = startGame;
   document.getElementById('menu').onclick = stopGame;
+  buildCharSelector();
 
   toggle.onclick = () => {
     const collapsed = panel.classList.toggle('collapsed');
