@@ -762,47 +762,59 @@ function setPreviewVisible(v){
 }
 
 const PORTAL_SHAPES = ['circle','diamond','triangle','square'];
+const PORTAL_COLORS = ['#58e1ff','#7cff6b','#ff8ad8','#ffd23f','#b48cff','#ff7a5c'];
 
-// Small canvas-drawn icons so each tunnel mouth gets its own shape and size.
-function makePortalImage(shape){
-  const S = 16;
+// Small canvas-drawn icons so each tunnel mouth gets its own shape, size and
+// colour. Both ends of a tunnel share the same one, so matching is obvious.
+function makePortalImage(shape, color){
+  const S = 12;
   const cv = document.createElement('canvas');
   cv.width = cv.height = S*2;
   const g = cv.getContext('2d');
   g.scale(2,2);
   const c = S/2, r = S/2 - 2;
-  g.fillStyle = 'rgba(88,225,255,0.28)';
-  g.strokeStyle = '#58e1ff';
-  g.lineWidth = 2;
+  g.lineWidth = 1.6;
+  g.lineJoin = 'round';
   g.beginPath();
   if(shape === 'circle'){ g.arc(c, c, r, 0, Math.PI*2); }
   else if(shape === 'diamond'){ g.moveTo(c, c-r); g.lineTo(c+r, c); g.lineTo(c, c+r); g.lineTo(c-r, c); g.closePath(); }
   else if(shape === 'triangle'){ g.moveTo(c, c-r); g.lineTo(c+r*0.9, c+r*0.75); g.lineTo(c-r*0.9, c+r*0.75); g.closePath(); }
   else { g.rect(c-r, c-r, 2*r, 2*r); }
-  g.fill(); g.stroke();
+  g.strokeStyle = color;
+  g.fillStyle = color;
+  g.globalAlpha = 0.28; g.fill();
+  g.globalAlpha = 1; g.stroke();
   return g.getImageData(0, 0, S*2, S*2);
 }
 
-function nodeHash(n){
-  const s = String(n);
+function nodeHash(str){
+  const s = String(str);
   let h = 2166136261;
   for(let i=0; i<s.length; i++){ h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
   return h >>> 0;
 }
 
 function portalData(){
-  const seen = new Set(), features = [];
+  const pos = new Map();
   for(const e of state.edges){
-    for(const id of [e.a, e.b]){
-      if(!state.wrapMap.has(id) || seen.has(id)) continue;
-      seen.add(id);
-      const h = nodeHash(id);
-      const xy = id === e.a ? e.coords[0] : e.coords[e.coords.length-1];
-      features.push({
-        type:'Feature',
-        properties:{ icon:'portal-'+PORTAL_SHAPES[h % PORTAL_SHAPES.length], scale:0.7 + ((h>>>3) % 4) * 0.2 },
-        geometry:{ type:'Point', coordinates: toLngLat(xy[0], xy[1]) }
-      });
+    if(!pos.has(e.a)) pos.set(e.a, e.coords[0]);
+    if(!pos.has(e.b)) pos.set(e.b, e.coords[e.coords.length-1]);
+  }
+  const seen = new Set(), features = [];
+  for(const [id, w] of state.wrapMap){
+    const other = w.node;
+    const a = Math.min(id, other), b = Math.max(id, other);
+    const pairKey = a + '|' + b;
+    if(seen.has(pairKey)) continue;
+    seen.add(pairKey);
+    const h = nodeHash(pairKey);
+    const shape = PORTAL_SHAPES[h % PORTAL_SHAPES.length];
+    const ci = (h >>> 3) % PORTAL_COLORS.length;
+    const props = { icon:'portal-'+shape+'-'+ci, scale:0.55 + ((h >>> 6) % 4) * 0.15 };
+    for(const n of [a, b]){
+      const xy = pos.get(n);
+      if(!xy) continue;
+      features.push({ type:'Feature', properties: props, geometry:{ type:'Point', coordinates: toLngLat(xy[0], xy[1]) } });
     }
   }
   return { type:'FeatureCollection', features };
@@ -820,10 +832,12 @@ function addLayers(){
     layout:{ 'line-cap':'round', 'line-join':'round' },
     paint:{ 'line-color':'#ffd23f', 'line-width':3.5, 'line-opacity':0.5 } });
 
-  for(const s of PORTAL_SHAPES){
-    const name = 'portal-'+s;
-    if(!(map.hasImage && map.hasImage(name))) map.addImage(name, makePortalImage(s));
-  }
+  PORTAL_SHAPES.forEach((s, si) => {
+    PORTAL_COLORS.forEach((c, ci) => {
+      const name = 'portal-'+s+'-'+ci;
+      if(!(map.hasImage && map.hasImage(name))) map.addImage(name, makePortalImage(s, c));
+    });
+  });
   map.addSource('portals', { type:'geojson', data: portalData() });
   map.addLayer({ id:'portals', type:'symbol', source:'portals',
     layout:{ 'icon-image':['get','icon'], 'icon-size':['get','scale'],
