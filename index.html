@@ -250,7 +250,10 @@ const SPEED = 62;             // metres / second, at level 1
 const SPEED_STEP = 0.12;      // each cleared level makes Pac-Man this much faster
 const MAX_SPEED_MULT = 2.2;   // cap so later levels stay playable
 function speedFactor(){ return Math.min(MAX_SPEED_MULT, 1 + (state.level - 1) * SPEED_STEP); }
-const PELLET_SPACING = 25;    // metres between dots
+const PELLET_SPACING = 25;    // metres between dots on quiet roads
+const DENSITY_RADIUS = 90;    // metres: look this far to count neighbouring roads
+const MAX_SPACING_MULT = 2.8; // dense blocks space dots out this much more
+const DOT_MIN_SEP = 16;       // metres: thin dots that still bunch together
 const EAT_RADIUS = 9;         // metres
 const CELL = 24;              // spatial grid cell (metres)
 const CATCH_RADIUS = 16;      // metres: a ghost this close to Pac-Man catches him
@@ -846,14 +849,69 @@ function chooseAtNode(nodeId, cameIndex){
 // ---------- pellets ----------
 function cellKey(x,y){ return Math.floor(x/CELL)+','+Math.floor(y/CELL); }
 
+// Dot spacing per edge. Roads that crowd together (a dense downtown grid) get
+// wider spacing, so they don't turn into a solid carpet of dots; quiet roads
+// keep the base spacing.
+function pelletSpacings(){
+  const mids = state.edges.map(e => pointAt(e, e.length/2));
+  const cell = DENSITY_RADIUS;
+  const grid = new Map();
+  mids.forEach((m,i) => {
+    const k = Math.floor(m[0]/cell) + ',' + Math.floor(m[1]/cell);
+    if(!grid.has(k)) grid.set(k, []);
+    grid.get(k).push(i);
+  });
+  return mids.map((m,i) => {
+    const cx = Math.floor(m[0]/cell), cy = Math.floor(m[1]/cell);
+    let n = 0;
+    for(let a=-1;a<=1;a++) for(let b=-1;b<=1;b++){
+      const arr = grid.get((cx+a) + ',' + (cy+b));
+      if(!arr) continue;
+      for(const j of arr){
+        if(j === i) continue;
+        if(Math.hypot(mids[j][0]-m[0], mids[j][1]-m[1]) <= DENSITY_RADIUS) n++;
+      }
+    }
+    return PELLET_SPACING * Math.min(MAX_SPACING_MULT, 1 + Math.max(0, n-2) * 0.16);
+  });
+}
+
+// Greedily drop dots that sit too close to one already kept (parallel streets a
+// few metres apart, duplicated carriageways). Keeps the closest one.
+function thinDots(points){
+  const cell = DOT_MIN_SEP;
+  const grid = new Map();
+  const out = [];
+  for(const p of points){
+    const cx = Math.floor(p.x/cell), cy = Math.floor(p.y/cell);
+    let near = false;
+    for(let a=-1;a<=1 && !near;a++) for(let b=-1;b<=1 && !near;b++){
+      const arr = grid.get((cx+a) + ',' + (cy+b));
+      if(!arr) continue;
+      for(const q of arr){
+        if(Math.hypot(q.x-p.x, q.y-p.y) < DOT_MIN_SEP){ near = true; break; }
+      }
+    }
+    if(near) continue;
+    out.push(p);
+    const k = cx + ',' + cy;
+    if(!grid.has(k)) grid.set(k, []);
+    grid.get(k).push(p);
+  }
+  return out;
+}
+
 function placePellets(){
-  const all = [];
-  for(const e of state.edges){
-    for(let d = PELLET_SPACING*0.5; d < e.length - 1; d += PELLET_SPACING){
+  const spacings = pelletSpacings();
+  let all = [];
+  state.edges.forEach((e,i) => {
+    const sp = spacings[i];
+    for(let d = sp*0.5; d < e.length - 1; d += sp){
       const p = pointAt(e, d);
       all.push({ x:p[0], y:p[1] });
     }
-  }
+  });
+  all = thinDots(all);
   // Choose up to four power pellets spread across the play area, one per
   // quadrant, each placed on an existing dot so it sits on a road.
   const used = new Set();
