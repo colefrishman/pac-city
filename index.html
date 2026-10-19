@@ -250,9 +250,9 @@ const SPEED = 62;             // metres / second, at level 1
 const SPEED_STEP = 0.12;      // each cleared level makes Pac-Man this much faster
 const MAX_SPEED_MULT = 2.2;   // cap so later levels stay playable
 function speedFactor(){ return Math.min(MAX_SPEED_MULT, 1 + (state.level - 1) * SPEED_STEP); }
-const PELLET_SPACING = 25;    // metres between dots on quiet roads
-const DENSITY_RADIUS = 90;    // metres: look this far to count neighbouring roads
-const MAX_SPACING_MULT = 2.8; // dense blocks space dots out this much more
+const PELLET_SPACING = 25;    // minimum metres between dots (quiet rural roads)
+const TARGET_DOTS = 240;      // roughly how many dots the whole board aims for
+const MAX_SPACING_MULT = 2.8; // dense road systems may space dots out this much more
 const DOT_MIN_SEP = 16;       // metres: thin dots that still bunch together
 const EAT_RADIUS = 9;         // metres
 const CELL = 24;              // spatial grid cell (metres)
@@ -849,31 +849,14 @@ function chooseAtNode(nodeId, cameIndex){
 // ---------- pellets ----------
 function cellKey(x,y){ return Math.floor(x/CELL)+','+Math.floor(y/CELL); }
 
-// Dot spacing per edge. Roads that crowd together (a dense downtown grid) get
-// wider spacing, so they don't turn into a solid carpet of dots; quiet roads
-// keep the base spacing.
-function pelletSpacings(){
-  const mids = state.edges.map(e => pointAt(e, e.length/2));
-  const cell = DENSITY_RADIUS;
-  const grid = new Map();
-  mids.forEach((m,i) => {
-    const k = Math.floor(m[0]/cell) + ',' + Math.floor(m[1]/cell);
-    if(!grid.has(k)) grid.set(k, []);
-    grid.get(k).push(i);
-  });
-  return mids.map((m,i) => {
-    const cx = Math.floor(m[0]/cell), cy = Math.floor(m[1]/cell);
-    let n = 0;
-    for(let a=-1;a<=1;a++) for(let b=-1;b<=1;b++){
-      const arr = grid.get((cx+a) + ',' + (cy+b));
-      if(!arr) continue;
-      for(const j of arr){
-        if(j === i) continue;
-        if(Math.hypot(mids[j][0]-m[0], mids[j][1]-m[1]) <= DENSITY_RADIUS) n++;
-      }
-    }
-    return PELLET_SPACING * Math.min(MAX_SPACING_MULT, 1 + Math.max(0, n-2) * 0.16);
-  });
+// One spacing for the whole board, based on how much road there is. A dense
+// downtown grid (Boston) gets wider spacing so it doesn't become a carpet of
+// dots; a sparse rural network keeps the base spacing.
+function dotSpacing(){
+  let total = 0;
+  for(const e of state.edges) total += e.length;
+  const s = total / TARGET_DOTS;
+  return Math.max(PELLET_SPACING, Math.min(PELLET_SPACING * MAX_SPACING_MULT, s));
 }
 
 // Greedily drop dots that sit too close to one already kept (parallel streets a
@@ -902,15 +885,14 @@ function thinDots(points){
 }
 
 function placePellets(){
-  const spacings = pelletSpacings();
+  const sp = dotSpacing();
   let all = [];
-  state.edges.forEach((e,i) => {
-    const sp = spacings[i];
+  for(const e of state.edges){
     for(let d = sp*0.5; d < e.length - 1; d += sp){
       const p = pointAt(e, d);
       all.push({ x:p[0], y:p[1] });
     }
-  });
+  }
   all = thinDots(all);
   // Choose up to four power pellets spread across the play area, one per
   // quadrant, each placed on an existing dot so it sits on a road.
