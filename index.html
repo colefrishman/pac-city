@@ -115,7 +115,7 @@
   <button id="start" class="primary">Start game here</button>
   <div id="panel-foot">
     <small>The dashed box shows the level area. Pan the map to move it.
-      Roads &copy; OpenStreetMap contributors via Overpass. Geocoding via Nominatim.</small>
+      Roads &copy; OpenStreetMap contributors &middot; tiles by OpenFreeMap / OpenMapTiles. Geocoding via Nominatim.</small>
   </div>
 </div>
 
@@ -281,14 +281,14 @@ const MAX_PAIR = 220;         // metres: opposite-edge roads up to this far apar
 const MERGE_DIST = 25;        // metres: dual carriageways closer than this merge into one
 const PARALLEL_DOT = 0.97;    // cos(~14°): headings this close count as the same road
 const PERP_MAX = 0.8;         // side-by-side: offset must be mostly perpendicular to the road
-const ROAD_TYPES = 'trunk|primary|secondary|tertiary|unclassified|residential';
-const OVERPASS = [
-  'https://overpass-api.de/api/interpreter',
-  'https://overpass.kumi.systems/api/interpreter',
-  'https://maps.mail.ru/osm/tools/overpass/api/interpreter'
-];
-const OVERPASS_TIMEOUT = 20000;   // abort an endpoint that hangs this long
-const OVERPASS_STAGGER = 2000;    // start each fallback endpoint this much later
+// Road data comes from the same vector tiles the basemap renders, so we never
+// hit Overpass (or any third-party query service). OpenMapTiles has no
+// "unclassified"/"residential" classes: those are grouped under "minor".
+const ROAD_CLASSES = new Set(['trunk', 'primary', 'secondary', 'tertiary', 'minor']);
+const ROAD_SOURCE = 'openmaptiles';
+const ROAD_LAYER = 'transportation';
+const TILE_WAIT = 15000;        // wait this long for basemap tiles to finish loading
+const COORD_Q = 1e6;            // quantize lng/lat (~0.1 m) so ways stitch at shared nodes
 const DRV = { up:{x:0,y:1}, down:{x:0,y:-1}, left:{x:-1,y:0}, right:{x:1,y:0} };
 
 // Roads are cached per play-area box and shared by concurrent requests, so
@@ -307,7 +307,7 @@ const map = new maplibregl.Map({
   keyboard: false,
   attributionControl: false
 });
-map.addControl(new maplibregl.AttributionControl({ compact:true, customAttribution:'Roads &copy; OpenStreetMap contributors' }), 'top-right');
+map.addControl(new maplibregl.AttributionControl({ compact:true, customAttribution:'Roads &copy; OpenStreetMap contributors &middot; tiles by OpenFreeMap' }), 'top-right');
 map.touchZoomRotate.disableRotation();
 
 const proj = { lng0:0, lat0:0, mlon:1, mlat:111320 };
@@ -326,51 +326,108 @@ let keyHeld = null;       // { x, y } from keyboard
 let stick = null;         // { x, y } from the analog joystick
 let swipe = null;         // { x, y, t } from a swipe gesture
 
-// ---------- Overpass + graph ----------
-async function fetchOverpass(bb){
+// ---------- roads from the basemap tiles ----------
+function roadKey(lng, lat){
+  return Math.round(lng * COORD_Q) + ',' + Math.round(lat * COORD_Q);
+}
+
+// Resolve once the map has finished loading tiles for the current view (or
+// after a timeout, so a slow tile server can't hang Start forever).
+function waitForTiles(){
+  return new Promise(resolve => {
+    let done = false;
+    const finish = () => {
+      if(done) return;
+      done = true;
+      clearTimeout(timer);
+      map.off('idle', finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, TILE_WAIT);
+    const ready = () => (typeof map.loaded !== 'function' || map.loaded()) &&
+      (typeof map.areTilesLoaded !== 'function' || map.areTilesLoaded());
+    if(ready()) return finish();
+    map.on('idle', finish);
+  });
+}
+
+// Which vector source/layer in the current style holds the roads. Normally the
+// OpenFreeMap defaults, but read from the style so a style change doesn't break
+// the game.
+function roadSourceInfo(){
+  try{
+    const style = map.getStyle && map.getStyle();
+    if(style){
+      for(const id of Object.keys(style.sources || {})){
+        const src = style.sources[id];
+        if(!src || src.type !== 'vector') continue;
+        for(const l of style.layers || []){
+          if(l.source === id && l['source-layer'] === ROAD_LAYER) return { source:id };
+        }
+      }
+    }
+  }catch(e){ /* fall back to the defaults */ }
+  return { source: ROAD_SOURCE };
+}
+
+// Turn the basemap's road LineStrings into the node/way shape buildGraph wants.
+// Tiles are clipped per feature, but shared intersections keep identical
+// coordinates, so keying synthetic nodes by position stitches the ways back
+// together.
+function collectRoads(){
+  const elements = [];
+  const points = new Map();
+  const seen = new Set();
+  let id = 0;
+  const source = roadSourceInfo().source;
+  const features = map.querySourceFeatures(source, { sourceLayer: ROAD_LAYER });
+  for(const f of features){
+    const cls = f.properties && f.properties.class;
+    if(!ROAD_CLASSES.has(cls) || !f.geometry) continue;
+    const parts = f.geometry.type === 'LineString' ? [f.geometry.coordinates]
+      : f.geometry.type === 'MultiLineString' ? f.geometry.coordinates : [];
+    for(const part of parts){
+      const nodes = [];
+      for(const pos of part){
+        if(!Array.isArray(pos) || pos.length < 2) continue;
+        const k = roadKey(pos[0], pos[1]);
+        if(nodes.length && nodes[nodes.length-1] === k) continue;
+        nodes.push(k);
+        if(!points.has(k)) points.set(k, [pos[0], pos[1]]);
+      }
+      if(nodes.length < 2) continue;
+      const sig = nodes.join('|');
+      if(seen.has(sig)) continue;                    // tile buffers duplicate features
+      seen.add(sig);
+      elements.push({ type:'way', id:id++, nodes, tags:{ highway:cls } });
+    }
+  }
+  for(const [k, pos] of points) elements.push({ type:'node', id:k, lon:pos[0], lat:pos[1] });
+  return { elements };
+}
+
+// Roads are cached per play-area box and shared by concurrent requests, so
+// revisiting an area (prefetch) makes "Start" feel instant afterwards.
+async function fetchRoads(bb){
   const key = bboxKey(bb);
   if(roadCache.has(key)) return roadCache.get(key);
   if(roadPending.has(key)) return roadPending.get(key);
-  const p = requestOverpass(bb).then(
-    data => { roadCache.set(key, data); roadPending.delete(key); return data; },
-    err  => { roadPending.delete(key); throw err; }
-  );
+  const p = (async () => {
+    await waitForTiles();
+    let data = collectRoads();
+    if(!data.elements.length){
+      // The source cache may not have caught up with a just-finished camera move.
+      await new Promise(r => setTimeout(r, 300));
+      data = collectRoads();
+    }
+    if(!data.elements.length) throw new Error('No road data here yet - try again in a second.');
+    roadCache.set(key, data);
+    if(roadCache.size > 8) roadCache.delete(roadCache.keys().next().value);
+    return data;
+  })();
   roadPending.set(key, p);
+  p.then(() => roadPending.delete(key), () => roadPending.delete(key));
   return p;
-}
-
-// Race the mirrors (staggered, so a healthy first mirror wins without load)
-// and abort whatever is still hanging so the player never waits on a dead one.
-async function requestOverpass(bb){
-  const q = '[out:json][timeout:25];way["highway"~"^('+ROAD_TYPES+')"](' +
-    bb.south+','+bb.west+','+bb.north+','+bb.east+');(._;>;);out body;';
-  const controllers = [];
-  let done = false;
-  const attempt = (url, delay) => new Promise((resolve, reject) => {
-    const ctrl = new AbortController();
-    controllers.push(ctrl);
-    setTimeout(() => {
-      if(done){ reject(new Error('skipped')); return; }
-      const timer = setTimeout(() => ctrl.abort(), OVERPASS_TIMEOUT);
-      fetch(url, {
-        method:'POST',
-        headers:{ 'Content-Type':'application/x-www-form-urlencoded' },
-        body:'data='+encodeURIComponent(q),
-        signal:ctrl.signal
-      })
-        .then(res => { if(!res.ok) throw new Error('HTTP '+res.status); return res.json(); })
-        .then(j => { clearTimeout(timer); if(!j.elements || !j.elements.length) throw new Error('no roads returned'); resolve(j); })
-        .catch(e => { clearTimeout(timer); reject(e); });
-    }, delay);
-  });
-  try{
-    return await Promise.any(OVERPASS.map((u,i) => attempt(u, i*OVERPASS_STAGGER)));
-  }catch(e){
-    throw new Error('Could not load roads - Overpass may be busy. Try again in a moment.');
-  }finally{
-    done = true;
-    for(const c of controllers) if(!c.signal.aborted) c.abort();
-  }
 }
 
 // Raw OSM nodes are dense shape points; collapse chains of degree-2 nodes into
@@ -1523,13 +1580,13 @@ function playBounds(){
   return boundsAround(c.lat, c.lng);
 }
 
-// Quietly fetch the roads for wherever the map is aimed, so pressing Start is
-// instant when the view hasn't moved since. Debounced to avoid hammering Overpass.
+// Quietly read the roads for wherever the map is aimed, so pressing Start is
+// instant when the view hasn't moved since. Debounced to avoid extra work.
 let prefetchTimer = null;
 function schedulePrefetch(){
   if(state.running || state.loading) return;
   clearTimeout(prefetchTimer);
-  prefetchTimer = setTimeout(() => { if(!state.running && !state.loading) fetchOverpass(playBounds()).catch(() => {}); }, 800);
+  prefetchTimer = setTimeout(() => { if(!state.running && !state.loading) fetchRoads(playBounds()).catch(() => {}); }, 800);
 }
 
 // Lock every interactive camera gesture while playing so the view is truly fixed.
@@ -1573,7 +1630,7 @@ async function startGame(){
     let secs = 0;
     const ticker = setInterval(() => { status.textContent = 'Loading roads... ' + (++secs) + 's'; }, 1000);
     let osm;
-    try{ osm = await fetchOverpass(bb); } finally { clearInterval(ticker); }
+    try{ osm = await fetchRoads(bb); } finally { clearInterval(ticker); }
     const g = buildGraph(osm, bb);
     state.edges = g.edges; state.adjSim = g.adjSim; state.boundary = g.boundary;
     clipDotlessEdges();
