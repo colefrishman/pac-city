@@ -46,8 +46,8 @@
     font-size:12px;color:#333;min-height:0}
   .diff.sel{border-color:#ffcf00;background:#fffbe6;font-weight:700}
 
-  #hud{position:absolute;left:12px;top:calc(12px + env(safe-area-inset-top));z-index:4;
-    display:flex;gap:8px;align-items:center}
+#hud{position:absolute;left:12px;top:calc(12px + env(safe-area-inset-top));z-index:4;
+  display:flex;flex-wrap:wrap;gap:8px;align-items:center;max-width:calc(100vw - 24px)}
   #score{background:#000000aa;color:#ffe14d;font-weight:800;padding:9px 14px;border-radius:999px;
     box-shadow:0 4px 16px #0006}
   #lives{background:#000000aa;color:#ff8ad8;font-weight:800;padding:9px 14px;border-radius:999px;
@@ -316,7 +316,8 @@ const state = {
   pac:null, score:0, level:1, last:0, dirty:false, lastPellet:0, marker:null, rot:null, pupils:[],
   boundary:new Set(), wrapMap:new Map(),
   ghosts:[], nodePos:new Map(), difficulty:'peaceful', lives:LIVES, invuln:0,
-  ghostMode:'scatter', ghostModeTimer:4, overlayMode:'level'
+  ghostMode:'scatter', ghostModeTimer:4, overlayMode:'level',
+  powerPellets:[], points:0, frightTimer:0, frightCombo:0
 };
 let keyHeld = null;       // { x, y } from keyboard
 let stick = null;         // { x, y } from the analog joystick
@@ -846,12 +847,38 @@ function chooseAtNode(nodeId, cameIndex){
 function cellKey(x,y){ return Math.floor(x/CELL)+','+Math.floor(y/CELL); }
 
 function placePellets(){
-  state.pellets = [];
+  const all = [];
   for(const e of state.edges){
     for(let d = PELLET_SPACING*0.5; d < e.length - 1; d += PELLET_SPACING){
       const p = pointAt(e, d);
-      state.pellets.push({ x:p[0], y:p[1], eaten:false });
+      all.push({ x:p[0], y:p[1] });
     }
+  }
+  // Choose up to four power pellets spread across the play area, one per
+  // quadrant, each placed on an existing dot so it sits on a road.
+  const used = new Set();
+  state.powerPellets = [];
+  if(all.length >= 4){
+    let cx = 0, cy = 0;
+    for(const p of all){ cx += p.x; cy += p.y; }
+    cx /= all.length; cy /= all.length;
+    const quads = [[-1,-1],[1,-1],[1,1],[-1,1]];
+    for(const [qx,qy] of quads){
+      let best = -1, bestD = -Infinity;
+      for(let i=0;i<all.length;i++){
+        if(used.has(i)) continue;
+        const dx = all[i].x - cx, dy = all[i].y - cy;
+        if((dx >= 0 ? 1 : -1) !== qx || (dy >= 0 ? 1 : -1) !== qy) continue;
+        const d = Math.hypot(dx, dy);
+        if(d > bestD){ bestD = d; best = i; }
+      }
+      if(best >= 0){ used.add(best); state.powerPellets.push({ x:all[best].x, y:all[best].y, eaten:false }); }
+    }
+  }
+  state.pellets = [];
+  for(let i=0;i<all.length;i++){
+    if(used.has(i)) continue;
+    state.pellets.push({ x:all[i].x, y:all[i].y, eaten:false });
   }
   state.grid = new Map();
   state.pellets.forEach((p,i) => {
@@ -859,6 +886,13 @@ function placePellets(){
     if(!state.grid.has(k)) state.grid.set(k, []);
     state.grid.get(k).push(i);
   });
+}
+
+function dotsRemaining(){
+  let n = 0;
+  for(const p of state.pellets) if(!p.eaten) n++;
+  for(const p of state.powerPellets) if(!p.eaten) n++;
+  return n;
 }
 
 function eatAround(x,y){
@@ -869,7 +903,15 @@ function eatAround(x,y){
     for(const idx of arr){
       const p = state.pellets[idx];
       if(p.eaten) continue;
-      if(Math.hypot(p.x-x, p.y-y) <= EAT_RADIUS){ p.eaten = true; state.score++; state.dirty = true; }
+      if(Math.hypot(p.x-x, p.y-y) <= EAT_RADIUS){ p.eaten = true; state.score++; state.points += 10; state.dirty = true; }
+    }
+  }
+  // Few of them, so a plain scan is fine.
+  for(const p of state.powerPellets){
+    if(p.eaten) continue;
+    if(Math.hypot(p.x-x, p.y-y) <= EAT_RADIUS){
+      p.eaten = true; state.score++; state.points += 50;
+      state.dirty = true; activateFright();
     }
   }
 }
@@ -907,6 +949,8 @@ function addGhostMarker(gh){
   const el = document.createElement('div');
   el.className = 'pac-marker';
   el.innerHTML = '<div class="pac-rot">' + ghostSVG({ kind:'ghost', body:gh.body, stroke:gh.stroke, pupil:'#233b6b' }, false) + '</div>';
+  gh.el = el;
+  gh.skinKey = gh.body + '|' + gh.stroke + '|#233b6b';
   gh.pupils = el.querySelectorAll ? Array.from(el.querySelectorAll('.pupil')) : [];
   gh.marker = new maplibregl.Marker({ element: el, anchor:'center' }).setLngLat([0,0]).addTo(map);
 }
@@ -919,6 +963,7 @@ function clearGhosts(){
 // Drop the ghosts on edges well away from Pac-Man's spawn.
 function spawnGhosts(){
   clearGhosts();
+  state.frightTimer = 0; state.frightCombo = 0;
   const diff = difficultyById(state.difficulty);
   if(!diff.ghosts || !state.edges.length || !state.pac) return;
   const p = pacPos();
@@ -946,6 +991,53 @@ function ghostSpeed(){
   return SPEED * diff.speed * Math.min(1.5, 1 + (state.level-1)*0.05);
 }
 
+// A power pellet was eaten: ghosts turn blue and edible for a few seconds.
+function activateFright(){
+  state.frightTimer = Math.max(3, 9 - (state.level-1)*0.6);
+  state.frightCombo = 0;
+  for(const gh of state.ghosts) applyGhostSkin(gh);
+}
+
+const FRIGHT_BLUE = { body:'#2b2bd6', stroke:'#161699', pupil:'#c8caff' };
+const FRIGHT_WHITE = { body:'#f2f2ff', stroke:'#b9b9e6', pupil:'#d94b4b' };
+
+function ghostSkin(gh){
+  if(state.frightTimer <= 0) return { body:gh.body, stroke:gh.stroke, pupil:'#233b6b' };
+  const flash = state.frightTimer < 2 && (Math.floor(state.frightTimer*6) % 2 === 0);
+  return flash ? FRIGHT_WHITE : FRIGHT_BLUE;
+}
+
+// Swap a ghost's sprite when it changes between normal, blue and flashing.
+function applyGhostSkin(gh){
+  const s = ghostSkin(gh);
+  const key = s.body + '|' + s.stroke + '|' + s.pupil;
+  if(gh.skinKey === key) return;
+  gh.skinKey = key;
+  if(!gh.el) return;
+  gh.el.innerHTML = '<div class="pac-rot">' + ghostSVG({ kind:'ghost', body:s.body, stroke:s.stroke, pupil:s.pupil }, false) + '</div>';
+  gh.pupils = gh.el.querySelectorAll ? Array.from(gh.el.querySelectorAll('.pupil')) : [];
+}
+
+// Drop one ghost far from Pac-Man (used when a frightened ghost is eaten).
+function respawnOneGhost(gh){
+  if(!state.edges.length) return;
+  const p = pacPos();
+  const far = state.edges
+    .map((e, i) => ({ i, e }))
+    .filter(x => { const m = pointAt(x.e, x.e.length/2); return Math.hypot(m[0]-p[0], m[1]-p[1]) > 120; });
+  const pool = far.length ? far : state.edges.map((e,i) => ({ i, e }));
+  const pick = pool[(Math.random()*pool.length)|0];
+  gh.edgeIndex = pick.i; gh.dist = pick.e.length/2; gh.forward = true; gh.waitNode = null;
+}
+
+function eatGhost(gh){
+  state.points += 200 * Math.pow(2, Math.min(state.frightCombo, 3));
+  state.frightCombo = Math.min(state.frightCombo + 1, 3);
+  respawnOneGhost(gh);
+  updateGhostView(gh);
+  updateHud();
+}
+
 // Where a ghost is heading right now: Pac-Man, a spot ahead of him, or a corner
 // when scattering. Each ghost has a slightly different personality.
 function ghostTarget(gh){
@@ -964,6 +1056,13 @@ function ghostTarget(gh){
 // At a node, head down the road that gets closest to the target (never reversing).
 function ghostChoose(gh, nodeId, cameIndex){
   const list = state.adjSim.get(nodeId) || [];
+  // Frightened ghosts wander at random instead of chasing.
+  if(state.frightTimer > 0){
+    const pool = list.filter(c => c.edgeIndex !== cameIndex);
+    if(!pool.length) return null;
+    const c = pool[(Math.random()*pool.length)|0];
+    return { edgeIndex:c.edgeIndex, forward:dirFor(c.edgeIndex, nodeId) };
+  }
   const t = ghostTarget(gh);
   let best = null, bestD = Infinity;
   for(const c of list){
@@ -978,7 +1077,7 @@ function ghostChoose(gh, nodeId, cameIndex){
 }
 
 function moveGhost(gh, dt){
-  let remaining = ghostSpeed() * dt;
+  let remaining = ghostSpeed() * (state.frightTimer > 0 ? 0.55 : 1) * dt;
   let guard = 0;
   while(remaining > 0 && guard++ < 24){
     if(gh.waitNode !== null){
@@ -1032,12 +1131,16 @@ function updateGhostView(gh){
 
 function updateGhosts(dt){
   if(!state.ghosts.length) return;
+  if(state.frightTimer > 0){
+    state.frightTimer -= dt;
+    if(state.frightTimer <= 0){ state.frightTimer = 0; state.frightCombo = 0; }
+  }
   state.ghostModeTimer -= dt;
   if(state.ghostModeTimer <= 0){
     state.ghostMode = state.ghostMode === 'chase' ? 'scatter' : 'chase';
     state.ghostModeTimer = state.ghostMode === 'chase' ? 8 : 5;
   }
-  for(const gh of state.ghosts){ moveGhost(gh, dt); updateGhostView(gh); }
+  for(const gh of state.ghosts){ moveGhost(gh, dt); applyGhostSkin(gh); updateGhostView(gh); }
 }
 
 function ghostCaught(x, y){
@@ -1070,7 +1173,7 @@ function showGameOver(){
   document.getElementById('hud').hidden = true;
   document.getElementById('ld-title').textContent = 'Caught!';
   document.getElementById('ld-stats').textContent =
-    'You reached level ' + state.level + ' with ' + state.score + ' dots eaten.';
+    'You reached level ' + state.level + ' with ' + state.points + ' points.';
   document.getElementById('ld-next').textContent = 'Try again';
   document.getElementById('leveldone').hidden = false;
 }
@@ -1153,6 +1256,11 @@ function renderPellets(force){
   for(const p of state.pellets){
     if(p.eaten) continue;
     features.push({ type:'Feature', properties:{},
+      geometry:{ type:'Point', coordinates: toLngLat(p.x, p.y) } });
+  }
+  for(const p of state.powerPellets){
+    if(p.eaten) continue;
+    features.push({ type:'Feature', properties:{ big:true },
       geometry:{ type:'Point', coordinates: toLngLat(p.x, p.y) } });
   }
   const src = map.getSource('pellets');
@@ -1274,8 +1382,10 @@ function addLayers(){
 
   map.addSource('pellets', { type:'geojson', data:{ type:'FeatureCollection', features:[] } });
   map.addLayer({ id:'pellets', type:'circle', source:'pellets',
-    paint:{ 'circle-radius':3, 'circle-color':'#ffffff',
-      'circle-stroke-color':'#000000aa', 'circle-stroke-width':0.8 } });
+    paint:{ 'circle-radius':['case', ['get','big'], 7, 3],
+      'circle-color':'#ffffff',
+      'circle-stroke-color':['case', ['get','big'], '#9db9de', '#000000aa'],
+      'circle-stroke-width':['case', ['get','big'], 2, 0.8] } });
 
   state.dirty = true;
   renderPellets(true);
@@ -1321,8 +1431,9 @@ function updatePacView(x, y){
 }
 
 function updateHud(){
+  const total = state.pellets.length + state.powerPellets.length;
   document.getElementById('score').textContent =
-    'Lv ' + state.level + ' · ' + state.score + '/' + state.pellets.length;
+    'Lv ' + state.level + ' · ' + state.points + ' pts · ' + state.score + '/' + total;
   const lv = document.getElementById('lives');
   if(lv){
     if(difficultyById(state.difficulty).ghosts > 0){ lv.hidden = false; lv.textContent = 'Lives ' + state.lives; }
@@ -1339,15 +1450,24 @@ function frame(now){
   let [x,y] = pacPos();
   eatAround(x,y);
   updateGhosts(dt);
-  if(state.ghosts.length && state.invuln <= 0 && ghostCaught(x,y)){
-    caught();
-    if(!state.running) return;
-    [x,y] = pacPos();
+  if(state.ghosts.length){
+    for(const gh of state.ghosts){
+      const g = ghostPos(gh);
+      if(Math.hypot(g[0]-x, g[1]-y) > CATCH_RADIUS) continue;
+      if(state.frightTimer > 0){
+        eatGhost(gh);                       // power pellet active: ghost is edible
+      } else if(state.invuln <= 0){
+        caught();
+        if(!state.running) return;
+        [x,y] = pacPos();
+        break;
+      }
+    }
   }
   updatePacView(x,y);
   renderPellets(false);
   updateHud();
-  if(state.pellets.length && state.score >= state.pellets.length){ levelComplete(); return; }
+  if((state.pellets.length + state.powerPellets.length) && dotsRemaining() === 0){ levelComplete(); return; }
   requestAnimationFrame(frame);
 }
 
@@ -1424,6 +1544,7 @@ async function startGame(){
     if(state.edges.length < 5) throw new Error('Not enough connected roads here. Move to a city block and retry.');
 
     state.score = 0; state.level = 1; state.pac = null;
+    state.points = 0; state.frightTimer = 0; state.frightCombo = 0;
     state.difficulty = chosenDiff;
     state.lives = LIVES;
     placePellets();
@@ -1480,7 +1601,8 @@ function levelComplete(){
   document.getElementById('ld-title').textContent = 'Level ' + state.level + ' cleared!';
   document.getElementById('ld-next').textContent = 'Next level';
   document.getElementById('ld-stats').textContent =
-    state.score + ' dots eaten · next level speed ×' + (1 + state.level*SPEED_STEP > MAX_SPEED_MULT
+    state.score + '/' + (state.pellets.length + state.powerPellets.length) + ' dots · ' +
+    state.points + ' pts · next speed ×' + (1 + state.level*SPEED_STEP > MAX_SPEED_MULT
       ? MAX_SPEED_MULT.toFixed(2) : (1 + state.level*SPEED_STEP).toFixed(2));
   document.getElementById('leveldone').hidden = false;
 }
@@ -1489,6 +1611,7 @@ function levelComplete(){
 function beginRound(){
   state.score = 0;
   state.pac = null;
+  state.frightTimer = 0; state.frightCombo = 0;
   placePellets();
   spawnPac();
   renderPellets(true);
