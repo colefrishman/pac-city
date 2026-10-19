@@ -253,7 +253,7 @@ function speedFactor(){ return Math.min(MAX_SPEED_MULT, 1 + (state.level - 1) * 
 const PELLET_SPACING = 25;    // metres between dots
 const EAT_RADIUS = 9;         // metres
 const CELL = 24;              // spatial grid cell (metres)
-const CATCH_RADIUS = 13;      // metres: a ghost this close to Pac-Man catches him
+const CATCH_RADIUS = 16;      // metres: a ghost this close to Pac-Man catches him
 const LIVES = 3;              // Pac-Man's spare lives when ghosts are on
 // Difficulty just decides how many ghosts roam and how fast they go. "Peaceful"
 // is the original, ghost-free game.
@@ -1130,6 +1130,7 @@ function updateGhostView(gh){
 }
 
 function updateGhosts(dt){
+  if(state.invuln > 0) state.invuln = Math.max(0, state.invuln - dt);
   if(!state.ghosts.length) return;
   if(state.frightTimer > 0){
     state.frightTimer -= dt;
