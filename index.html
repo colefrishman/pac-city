@@ -289,6 +289,7 @@ const ROAD_SOURCE = 'openmaptiles';
 const ROAD_LAYER = 'transportation';
 const TILE_WAIT = 15000;        // wait this long for basemap tiles to finish loading
 const COORD_Q = 1e6;            // quantize lng/lat (~0.1 m) so ways stitch at shared nodes
+const STITCH_DIST = 3;          // metres: a free road end this close to another road joins it
 const DRV = { up:{x:0,y:1}, down:{x:0,y:-1}, left:{x:-1,y:0}, right:{x:1,y:0} };
 
 // Roads are cached per play-area box and shared by concurrent requests, so
@@ -404,6 +405,116 @@ function collectRoads(){
   }
   for(const [k, pos] of points) elements.push({ type:'node', id:k, lon:pos[0], lat:pos[1] });
   return { elements };
+}
+
+// Tiles simplify every road on its own, so a way can end a few decimetres short
+// of the road it meets. Left alone those gaps become dead ends (and stray
+// portals), so snap each free end onto the nearest road, splitting that road
+// where the join lands.
+function stitchWays(osm, bb){
+  const inBox = (lng, lat) =>
+    lng >= bb.west && lng <= bb.east && lat >= bb.south && lat <= bb.north;
+  const nodeEls = new Map();
+  for(const el of osm.elements) if(el.type === 'node') nodeEls.set(el.id, el);
+  const ways = osm.elements
+    .filter(e => e.type === 'way' && e.nodes.length > 1)
+    .filter(w => w.nodes.some(n => {
+      const el = nodeEls.get(n);
+      return el && inBox(el.lon, el.lat);
+    }));
+  if(!ways.length) return osm;
+  const xyCache = new Map();
+  const posOf = key => {
+    if(xyCache.has(key)) return xyCache.get(key);
+    const el = nodeEls.get(key);
+    const p = el ? toXY(el.lon, el.lat) : null;
+    xyCache.set(key, p);
+    return p;
+  };
+
+  // A couple of passes: snapping one end can bring another road end within
+  // reach, so re-scan after each round.
+  for(let pass=0; pass<3; pass++){
+    const uses = new Map();
+    for(const w of ways) for(const n of w.nodes) uses.set(n, (uses.get(n)||0)+1);
+
+    const leaves = [];
+    for(const w of ways){
+      const a = w.nodes[0], b = w.nodes[w.nodes.length-1];
+      if((uses.get(a)||0) === 1) leaves.push({ w, at:0, p:posOf(a) });
+      if(b !== a && (uses.get(b)||0) === 1) leaves.push({ w, at:w.nodes.length-1, p:posOf(b) });
+    }
+    if(!leaves.length) break;
+
+    // Bucket every segment into a small grid so each free end only looks at the
+    // roads right next to it.
+    const CELL = 8;
+    const grid = new Map();
+    for(const other of ways){
+      for(let k=0; k+1<other.nodes.length; k++){
+        const A = posOf(other.nodes[k]), B = posOf(other.nodes[k+1]);
+        if(!A || !B) continue;
+        const x0 = Math.floor(Math.min(A[0],B[0])/CELL), x1 = Math.floor(Math.max(A[0],B[0])/CELL);
+        const y0 = Math.floor(Math.min(A[1],B[1])/CELL), y1 = Math.floor(Math.max(A[1],B[1])/CELL);
+        for(let cx=x0; cx<=x1; cx++) for(let cy=y0; cy<=y1; cy++){
+          const bk = cx+','+cy;
+          if(!grid.has(bk)) grid.set(bk, []);
+          grid.get(bk).push({ other, k, A, B });
+        }
+      }
+    }
+
+    const stitches = [], inserts = new Map();
+    for(const leaf of leaves){
+      if(!leaf.p) continue;
+      const cx = Math.floor(leaf.p[0]/CELL), cy = Math.floor(leaf.p[1]/CELL);
+      let best = null;
+      for(let i=-1;i<=1;i++) for(let j=-1;j<=1;j++){
+        const arr = grid.get((cx+i)+','+(cy+j));
+        if(!arr) continue;
+        for(const seg of arr){
+          if(seg.other === leaf.w) continue;
+          const { A, B } = seg;
+          const dx = B[0]-A[0], dy = B[1]-A[1];
+          const L2 = dx*dx + dy*dy;
+          let t = L2 ? ((leaf.p[0]-A[0])*dx + (leaf.p[1]-A[1])*dy)/L2 : 0;
+          if(t < 0) t = 0; else if(t > 1) t = 1;
+          const qx = A[0]+dx*t, qy = A[1]+dy*t;
+          const d = Math.hypot(leaf.p[0]-qx, leaf.p[1]-qy);
+          if(d <= STITCH_DIST && (!best || d < best.d)) best = { other:seg.other, k:seg.k, t, qx, qy, d };
+        }
+      }
+      if(!best) continue;
+      let targetKey;
+      if(best.t < 0.02) targetKey = best.other.nodes[best.k];
+      else if(best.t > 0.98) targetKey = best.other.nodes[best.k+1];
+      else {
+        const ll = toLngLat(best.qx, best.qy);
+        targetKey = roadKey(ll[0], ll[1]);
+        if(!nodeEls.has(targetKey)){
+          const nodeEl = { type:'node', id:targetKey, lon:ll[0], lat:ll[1] };
+          nodeEls.set(targetKey, nodeEl);
+          osm.elements.push(nodeEl);
+          xyCache.set(targetKey, [best.qx, best.qy]);
+        }
+        if(!inserts.has(best.other)) inserts.set(best.other, []);
+        inserts.get(best.other).push({ k:best.k, t:best.t, key:targetKey });
+      }
+      stitches.push({ leaf, targetKey });
+    }
+    if(!stitches.length) break;
+
+    // Splice the new join points in from the far end of each way backwards, so
+    // earlier insertions don't shift the indices still to process.
+    for(const [way, list] of inserts){
+      list.sort((a,b) => b.k - a.k || b.t - a.t);
+      for(const it of list){
+        if(!way.nodes.includes(it.key)) way.nodes.splice(it.k+1, 0, it.key);
+      }
+    }
+    for(const { leaf, targetKey } of stitches) leaf.w.nodes[leaf.at] = targetKey;
+  }
+  return osm;
 }
 
 // Roads are cached per play-area box and shared by concurrent requests, so
@@ -654,7 +765,16 @@ function pruneShortDeadEnds(minLen){
 // cut it. Runs before tunnel pairing so any dead-ends it creates get cleaned up.
 function hasRoomForDot(e){ return e.length - 1 > PELLET_SPACING*0.5; }
 function clipDotlessEdges(){
-  const kept = state.edges.filter(hasRoomForDot);
+  const deg = new Map();
+  for(const e of state.edges){
+    deg.set(e.a, (deg.get(e.a)||0)+1);
+    deg.set(e.b, (deg.get(e.b)||0)+1);
+  }
+  // Short connectors between intersections are part of the road network; only
+  // cut dead-end spurs. Cutting a connector splits the road and invents two
+  // portals in the middle of it.
+  const kept = state.edges.filter(e => hasRoomForDot(e) ||
+    ((deg.get(e.a)||0) > 1 && (deg.get(e.b)||0) > 1));
   if(kept.length === state.edges.length) return;
   const adjSim = new Map();
   kept.forEach((e, ei) => {
@@ -742,6 +862,14 @@ function keepLargestComponent(){
     adjSim.get(e.b).push({ edgeIndex:ei, node:e.b });
   });
   state.adjSim = adjSim;
+}
+
+// Drop tunnel links whose road ends were pruned, so a portal never points at a
+// node that is no longer on the board.
+function cleanWraps(){
+  for(const [id, w] of state.wrapMap){
+    if(!state.adjSim.has(id) || !state.adjSim.has(w.node)) state.wrapMap.delete(id);
+  }
 }
 
 // Pair up roads that run past opposite edges of the play area so Pac-Man can
@@ -1437,7 +1565,9 @@ function portalData(){
   const seen = new Set(), features = [];
   for(const [id, w] of state.wrapMap){
     const other = w.node;
-    const a = Math.min(id, other), b = Math.max(id, other);
+    // Node ids are coordinate strings now, so compare them as strings - Math.min
+    // would turn them into NaN and silently drop every portal.
+    const a = id <= other ? id : other, b = id <= other ? other : id;
     const pairKey = a + '|' + b;
     if(seen.has(pairKey)) continue;
     seen.add(pairKey);
@@ -1631,6 +1761,7 @@ async function startGame(){
     const ticker = setInterval(() => { status.textContent = 'Loading roads... ' + (++secs) + 's'; }, 1000);
     let osm;
     try{ osm = await fetchRoads(bb); } finally { clearInterval(ticker); }
+    stitchWays(osm, bb);
     const g = buildGraph(osm, bb);
     state.edges = g.edges; state.adjSim = g.adjSim; state.boundary = g.boundary;
     clipDotlessEdges();
@@ -1639,6 +1770,7 @@ async function startGame(){
     wrapDeadEnds();
     pruneShortDeadEnds(Infinity);   // leftover dead-ends with no partner: cut them
     keepLargestComponent();
+    cleanWraps();
     if(state.edges.length < 5) throw new Error('Not enough connected roads here. Move to a city block and retry.');
 
     state.score = 0; state.level = 1; state.pac = null;
