@@ -275,6 +275,8 @@ const GHOST_DEFS = [
 let chosenDiff = 'peaceful';
 function difficultyById(id){ return DIFFICULTIES.find(d => d.id === id) || DIFFICULTIES[0]; }
 const CONTINUE_DOT = 0.25;    // cos(~75deg): auto-continue only through gentle bends
+const TURN_BUFFER = 500;      // ms a tapped direction stays queued for the next node
+const TURN_LOOKAHEAD = 12;    // metres: judge a road by where it goes, not its first kink
 const PLAY_HALF = 350;        // half-size of play area (metres)
 const MIN_STUB = 35;          // metres: dead-end stubs shorter than this are dropped
 const MAX_PAIR = 220;         // metres: opposite-edge roads up to this far apart form a tunnel
@@ -326,6 +328,7 @@ const state = {
 let keyHeld = null;       // { x, y } from keyboard
 let stick = null;         // { x, y } from the analog joystick
 let swipe = null;         // { x, y, t } from a swipe gesture
+let turnBuf = null;       // { x, y, t }: a tapped direction queued for the next node
 
 // ---------- roads from the basemap tiles ----------
 function roadKey(lng, lat){
@@ -1189,16 +1192,20 @@ function pointAt(e, d){
   ];
 }
 
-function headingFrom(nodeId, edgeIndex){
+function headingFrom(nodeId, edgeIndex, look){
   const e = state.edges[edgeIndex];
   let startIdx, step;
   if(e.a === nodeId && e.b !== nodeId){ startIdx = 0; step = 1; }
   else if(e.b === nodeId && e.a !== nodeId){ startIdx = e.coords.length - 1; step = -1; }
   else { startIdx = 0; step = 1; }
   const p0 = e.coords[startIdx];
-  let p1 = p0;
+  let p1 = p0, acc = 0;
   for(let i = startIdx + step; i >= 0 && i < e.coords.length; i += step){
-    if(Math.hypot(e.coords[i][0]-p0[0], e.coords[i][1]-p0[1]) > 0.01){ p1 = e.coords[i]; break; }
+    const d = Math.hypot(e.coords[i][0]-p0[0], e.coords[i][1]-p0[1]);
+    if(d <= 0.01) continue;
+    p1 = e.coords[i];
+    acc = d;
+    if(acc >= (look || 0)) break;
   }
   const dx = p1[0]-p0[0], dy = p1[1]-p0[1];
   const L = Math.hypot(dx,dy) || 1;
@@ -1211,10 +1218,17 @@ function dirFor(edgeIndex, nodeId){
   return state.edges[edgeIndex].a === nodeId;
 }
 
+function rememberTurn(v, ms){
+  if(!v) return;
+  turnBuf = { x:v.x, y:v.y, t:performance.now() + (ms || TURN_BUFFER) };
+}
+
 function desiredVec(){
   if(stick) return stick;
   if(keyHeld) return keyHeld;
-  if(swipe && performance.now() < swipe.t) return { x:swipe.x, y:swipe.y };
+  const now = performance.now();
+  if(swipe && now < swipe.t) return { x:swipe.x, y:swipe.y };
+  if(turnBuf && now < turnBuf.t) return { x:turnBuf.x, y:turnBuf.y };
   return null;
 }
 
@@ -1242,34 +1256,37 @@ function arrivalHeadingAt(cameIndex, nodeId){
 
 // Pick the next edge at a node. Returns null when Pac-Man must stop (wall).
 function chooseAtNode(nodeId, cameIndex){
-  const list = state.adjSim.get(nodeId) || [];
-  const cands = (cameIndex == null) ? list : list.filter(c => c.edgeIndex !== cameIndex);
+  const cands = state.adjSim.get(nodeId) || [];
   if(!cands.length) return null;
 
   const arr = (cameIndex != null) ? arrivalHeadingAt(cameIndex, nodeId) : null;
   const desired = desiredVec();
 
-  // Held direction: take whichever road is closest in angle. Ties (e.g. an exact
-  // diagonal between two roads) prefer the straighter option to keep momentum.
+  // Held direction: take whichever road is closest in angle. If the player is
+  // pointing away from the road they came in on, prefer the turn over a near-tie
+  // with the straight continuation (an analog stick often lands between two roads).
   if(desired){
-    let best = null, bestDot = -Infinity, bestAlign = -Infinity;
+    const wantsTurn = arr ? (arr.x*desired.x + arr.y*desired.y) < 0.8 : false;
+    let best = null, bestScore = -Infinity, bestDot = -Infinity;
     for(const c of cands){
-      const h = headingFrom(nodeId, c.edgeIndex);
+      const h = headingFrom(nodeId, c.edgeIndex, TURN_LOOKAHEAD);
       const dot = h.x*desired.x + h.y*desired.y;
+      if(dot <= 0) continue;
       const align = arr ? (h.x*arr.x + h.y*arr.y) : 0;
-      if(dot > bestDot + 1e-6 || (Math.abs(dot - bestDot) <= 1e-6 && align > bestAlign)){
-        bestDot = dot; bestAlign = align; best = c;
+      const score = dot + (wantsTurn && align > -0.5 ? 0.15 * (1 - align) : 0);
+      if(score > bestScore + 1e-6 || (Math.abs(score - bestScore) <= 1e-6 && dot > bestDot)){
+        best = c; bestScore = score; bestDot = dot;
       }
     }
     // Only ignore the held direction if every road here points against it.
-    if(bestDot > 0) return { edgeIndex:best.edgeIndex, forward: dirFor(best.edgeIndex, nodeId) };
+    if(best) return { edgeIndex:best.edgeIndex, forward: dirFor(best.edgeIndex, nodeId) };
   }
 
   // No usable held direction: roll through gentle bends, otherwise stop.
   if(arr){
     let best = null, bestDot = -Infinity;
     for(const c of cands){
-      const h = headingFrom(nodeId, c.edgeIndex);
+      const h = headingFrom(nodeId, c.edgeIndex, TURN_LOOKAHEAD);
       const dot = h.x*arr.x + h.y*arr.y;
       if(dot > bestDot){ bestDot = dot; best = c; }
     }
@@ -1659,7 +1676,8 @@ function movePac(dt){
     const d = desiredVec();
     if(d){
       const h = travelHeading();
-      if(h.x*d.x + h.y*d.y <= -0.6){
+      // Only a near-opposite push is a U-turn; a sharp fork still waits for the node.
+      if(h.x*d.x + h.y*d.y <= -0.85){
         // dist is measured from coords[0], so flipping direction does NOT move us
         pac.forward = !pac.forward;
         if(swipe) swipe = null;
@@ -2128,7 +2146,7 @@ async function geocode(q){
 }
 
 // ---------- input ----------
-function doSwipe(v){ swipe = { x:v.x, y:v.y, t: performance.now() + 1500 }; }
+function doSwipe(v){ swipe = { x:v.x, y:v.y, t: performance.now() + 1500 }; turnBuf = null; }
 
 function bindStick(){
   const base = document.getElementById('stick-base');
@@ -2136,7 +2154,7 @@ function bindStick(){
   if(!base || !knob) return;
   const R = 44;                     // knob travel in px
   const DEAD = 0.16;                // ignore the very centre
-  let id = null;
+  let id = null, lastStick = null;
   const center = () => { const r = base.getBoundingClientRect(); return { x:r.left+r.width/2, y:r.top+r.height/2 }; };
   const apply = e => {
     const c = center();
@@ -2144,8 +2162,13 @@ function bindStick(){
     const len = Math.hypot(dx, dy) || 1;
     const travel = Math.min(len, R);
     knob.style.transform = 'translate(' + (dx/len*travel).toFixed(1) + 'px,' + (dy/len*travel).toFixed(1) + 'px)';
-    if(len / R < DEAD){ stick = null; return; }
+    if(len / R < DEAD){
+      if(stick) rememberTurn(stick);
+      stick = null;
+      return;
+    }
     stick = { x: dx/len, y: -dy/len };   // screen down -> world north-up
+    lastStick = stick;
   };
   base.addEventListener('pointerdown', e => {
     e.preventDefault(); id = e.pointerId;
@@ -2155,7 +2178,8 @@ function bindStick(){
   base.addEventListener('pointermove', e => { if(e.pointerId !== id) return; e.preventDefault(); apply(e); });
   const end = e => {
     if(id !== null && e.pointerId !== id) return;
-    id = null; stick = null; knob.style.transform = 'translate(0,0)';
+    if(lastStick) rememberTurn(lastStick);
+    id = null; lastStick = null; stick = null; knob.style.transform = 'translate(0,0)';
   };
   base.addEventListener('pointerup', end);
   base.addEventListener('pointercancel', end);
@@ -2183,13 +2207,24 @@ function bindControls(){
 
   const keys = { ArrowUp:'up', ArrowDown:'down', ArrowLeft:'left', ArrowRight:'right',
     w:'up', s:'down', a:'left', d:'right' };
+  const held = [];                  // direction keys in press order
   addEventListener('keydown', e => {
     const dir = keys[e.key] || keys[e.key.toLowerCase()];
-    if(dir && state.running){ e.preventDefault(); keyHeld = DRV[dir]; }
+    if(!dir || !state.running) return;
+    e.preventDefault();
+    const i = held.indexOf(dir);
+    if(i >= 0) held.splice(i, 1);
+    held.push(dir);
+    keyHeld = DRV[dir];
   });
   addEventListener('keyup', e => {
     const dir = keys[e.key] || keys[e.key.toLowerCase()];
-    if(dir) keyHeld = null;
+    if(!dir) return;
+    const i = held.indexOf(dir);
+    if(i >= 0) held.splice(i, 1);
+    const was = keyHeld;
+    keyHeld = held.length ? DRV[held[held.length-1]] : null;
+    if(was && !keyHeld) rememberTurn(was);
   });
 }
 
