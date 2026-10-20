@@ -400,7 +400,10 @@ function collectRoads(){
       const sig = nodes.join('|');
       if(seen.has(sig)) continue;                    // tile buffers duplicate features
       seen.add(sig);
-      elements.push({ type:'way', id:id++, nodes, tags:{ highway:cls } });
+      const tags = { highway: cls };
+      if(f.properties.brunnel) tags.brunnel = f.properties.brunnel;
+      if(f.properties.layer !== undefined && f.properties.layer !== null) tags.layer = f.properties.layer;
+      elements.push({ type:'way', id:id++, nodes, tags });
     }
   }
   for(const [k, pos] of points) elements.push({ type:'node', id:k, lon:pos[0], lat:pos[1] });
@@ -435,14 +438,39 @@ function stitchWays(osm, bb){
   // A couple of passes: snapping one end can bring another road end within
   // reach, so re-scan after each round.
   for(let pass=0; pass<3; pass++){
-    const uses = new Map();
-    for(const w of ways) for(const n of w.nodes) uses.set(n, (uses.get(n)||0)+1);
+    // Find free ends from the road geometry, not from how many ways use a node.
+    // Two duplicate/tile-split ways can both end at the same node, and a road
+    // split across two features shares a node in the middle: counting uses
+    // would mistake those for through nodes. A real free end has no pair of
+    // incident headings pointing in opposite directions.
+    const dirAt = new Map();
+    const addDir = (n, dx, dy) => {
+      const L = Math.hypot(dx, dy); if(L < 1e-6) return;
+      if(!dirAt.has(n)) dirAt.set(n, []);
+      dirAt.get(n).push({ x:dx/L, y:dy/L });
+    };
+    for(const w of ways){
+      for(let i=0; i+1<w.nodes.length; i++){
+        const A = posOf(w.nodes[i]), B = posOf(w.nodes[i+1]);
+        if(!A || !B) continue;
+        addDir(w.nodes[i], B[0]-A[0], B[1]-A[1]);
+        addDir(w.nodes[i+1], A[0]-B[0], A[1]-B[1]);
+      }
+    }
+    const isFreeEnd = id => {
+      const ds = dirAt.get(id);
+      if(!ds || !ds.length) return false;
+      for(let i=0; i<ds.length; i++) for(let j=i+1; j<ds.length; j++){
+        if(ds[i].x*ds[j].x + ds[i].y*ds[j].y < -0.6) return false;
+      }
+      return true;
+    };
 
     const leaves = [];
     for(const w of ways){
       const a = w.nodes[0], b = w.nodes[w.nodes.length-1];
-      if((uses.get(a)||0) === 1) leaves.push({ w, at:0, p:posOf(a) });
-      if(b !== a && (uses.get(b)||0) === 1) leaves.push({ w, at:w.nodes.length-1, p:posOf(b) });
+      if(isFreeEnd(a)) leaves.push({ w, at:0, p:posOf(a) });
+      if(b !== a && isFreeEnd(b)) leaves.push({ w, at:w.nodes.length-1, p:posOf(b) });
     }
     if(!leaves.length) break;
 
@@ -469,11 +497,17 @@ function stitchWays(osm, bb){
       if(!leaf.p) continue;
       const cx = Math.floor(leaf.p[0]/CELL), cy = Math.floor(leaf.p[1]/CELL);
       let best = null;
-      for(let i=-1;i<=1;i++) for(let j=-1;j<=1;j++){
+      const reach = Math.ceil(STITCH_DIST / CELL);
+      for(let i=-reach;i<=reach;i++) for(let j=-reach;j<=reach;j++){
         const arr = grid.get((cx+i)+','+(cy+j));
         if(!arr) continue;
         for(const seg of arr){
-          if(seg.other === leaf.w) continue;
+          if(seg.other === leaf.w){
+            // A road can loop back and end on itself; only skip the segment
+            // that actually touches the free end, not the whole way.
+            const adj = leaf.at === 0 ? 0 : seg.other.nodes.length - 2;
+            if(seg.k === adj) continue;
+          }
           const { A, B } = seg;
           const dx = B[0]-A[0], dy = B[1]-A[1];
           const L2 = dx*dx + dy*dy;
@@ -515,6 +549,219 @@ function stitchWays(osm, bb){
     for(const { leaf, targetKey } of stitches) leaf.w.nodes[leaf.at] = targetKey;
   }
   return osm;
+}
+
+// Vector tiles carry no OSM node ids. An intersection that shared one node in
+// OSM can arrive as two unrelated ways whose segments simply cross: neither end
+// is a dead end, so stitchWays cannot see it. Split both ways at every at-grade
+// crossing so they share a node, the way the original map did. Bridges, tunnels
+// and roads on different layers are left alone.
+function nodeCrossings(osm, bb){
+  const inBox = (lng, lat) =>
+    lng >= bb.west && lng <= bb.east && lat >= bb.south && lat <= bb.north;
+  const nodeEls = new Map();
+  for(const el of osm.elements) if(el.type === 'node') nodeEls.set(el.id, el);
+  const ways = osm.elements
+    .filter(e => e.type === 'way' && e.nodes.length > 1)
+    .filter(w => w.nodes.some(n => {
+      const el = nodeEls.get(n);
+      return el && inBox(el.lon, el.lat);
+    }));
+  if(!ways.length) return osm;
+  const xyCache = new Map();
+  const posOf = key => {
+    if(xyCache.has(key)) return xyCache.get(key);
+    const el = nodeEls.get(key);
+    const p = el ? toXY(el.lon, el.lat) : null;
+    xyCache.set(key, p);
+    return p;
+  };
+  const layerOf = w => Number(w.tags && w.tags.layer) || 0;
+  const atGrade = w => !(w.tags && w.tags.brunnel);
+
+  const segs = [];
+  ways.forEach((w, wi) => {
+    for(let k=0; k+1<w.nodes.length; k++){
+      const A = posOf(w.nodes[k]), B = posOf(w.nodes[k+1]);
+      if(!A || !B) continue;
+      segs.push({ wi, k, A, B, a:w.nodes[k], b:w.nodes[k+1] });
+    }
+  });
+
+  const CELL = 24;
+  const grid = new Map();
+  for(let si=0; si<segs.length; si++){
+    const s = segs[si];
+    const x0 = Math.floor(Math.min(s.A[0],s.B[0])/CELL), x1 = Math.floor(Math.max(s.A[0],s.B[0])/CELL);
+    const y0 = Math.floor(Math.min(s.A[1],s.B[1])/CELL), y1 = Math.floor(Math.max(s.A[1],s.B[1])/CELL);
+    for(let cx=x0; cx<=x1; cx++) for(let cy=y0; cy<=y1; cy++){
+      const bk = cx+','+cy;
+      if(!grid.has(bk)) grid.set(bk, []);
+      grid.get(bk).push(si);
+    }
+  }
+
+  const seen = new Set(), inserts = new Map();
+  const ensureNode = (x, y) => {
+    const ll = toLngLat(x, y);
+    const key = roadKey(ll[0], ll[1]);
+    if(!nodeEls.has(key)){
+      const el = { type:'node', id:key, lon:ll[0], lat:ll[1] };
+      nodeEls.set(key, el);
+      osm.elements.push(el);
+    }
+    return key;
+  };
+  const addInsert = (w, k, t, key) => {
+    if(w.nodes[k] === key || w.nodes[k+1] === key) return;
+    if(!inserts.has(w)) inserts.set(w, []);
+    inserts.get(w).push({ k, t, key });
+  };
+
+  for(const arr of grid.values()){
+    for(let i=0; i<arr.length; i++) for(let j=i+1; j<arr.length; j++){
+      const ia = arr[i], ib = arr[j];
+      const pk = ia < ib ? ia+'_'+ib : ib+'_'+ia;
+      if(seen.has(pk)) continue;
+      seen.add(pk);
+      const s = segs[ia], t = segs[ib];
+      if(s.wi === t.wi) continue;
+      const ws = ways[s.wi], wt = ways[t.wi];
+      if(!atGrade(ws) || !atGrade(wt)) continue;
+      if(layerOf(ws) !== layerOf(wt)) continue;
+      if(s.a === t.a || s.a === t.b || s.b === t.a || s.b === t.b) continue;
+      const rx = s.B[0]-s.A[0], ry = s.B[1]-s.A[1];
+      const ux = t.B[0]-t.A[0], uy = t.B[1]-t.A[1];
+      const den = rx*uy - ry*ux;
+      if(Math.abs(den) < 1e-9) continue;
+      const qx = t.A[0]-s.A[0], qy = t.A[1]-s.A[1];
+      const st = (qx*uy - qy*ux) / den;
+      const tu = (qx*ry - qy*rx) / den;
+      // Endpoint contacts are handled by stitchWays (free ends) or are already
+      // shared nodes; only split genuine mid-segment crossings.
+      if(st <= 0.02 || st >= 0.98 || tu <= 0.02 || tu >= 0.98) continue;
+      const x = s.A[0]+rx*st, y = s.A[1]+ry*st;
+      const ll = toLngLat(x, y);
+      if(!inBox(ll[0], ll[1])) continue;
+      const key = ensureNode(x, y);
+      addInsert(ws, s.k, st, key);
+      addInsert(wt, t.k, tu, key);
+    }
+  }
+
+  for(const [w, list] of inserts){
+    list.sort((a,b) => b.k - a.k || b.t - a.t);
+    for(const it of list){
+      if(!w.nodes.includes(it.key)) w.nodes.splice(it.k+1, 0, it.key);
+    }
+  }
+  return osm;
+}
+
+// Safety net for the gaps stitching still misses: once the graph is built, any
+// remaining free end that sits right next to another road gets a tiny connector.
+// This catches duplicate/tile-split ways whose shared node made them look like
+// through roads to stitchWays.
+function weldLooseEnds(osm, bb, g){
+  const inBox = (lng, lat) =>
+    lng >= bb.west && lng <= bb.east && lat >= bb.south && lat <= bb.north;
+  const nodeEls = new Map();
+  for(const el of osm.elements) if(el.type === 'node') nodeEls.set(el.id, el);
+  const ways = osm.elements
+    .filter(e => e.type === 'way' && e.nodes.length > 1)
+    .filter(w => w.nodes.some(n => {
+      const el = nodeEls.get(n);
+      return el && inBox(el.lon, el.lat);
+    }));
+  const posOf = key => {
+    const el = nodeEls.get(key);
+    return el ? toXY(el.lon, el.lat) : null;
+  };
+
+  const deg = new Map();
+  for(const e of g.edges){
+    deg.set(e.a, (deg.get(e.a)||0)+1);
+    deg.set(e.b, (deg.get(e.b)||0)+1);
+  }
+  const leaves = [];
+  for(const e of g.edges){
+    if((deg.get(e.a)||0) === 1) leaves.push({ key:e.ids[0], edge:e });
+    if((deg.get(e.b)||0) === 1) leaves.push({ key:e.ids[e.ids.length-1], edge:e });
+  }
+  if(!leaves.length) return 0;
+
+  const CELL = 8;
+  const grid = new Map();
+  for(const w of ways){
+    for(let k=0; k+1<w.nodes.length; k++){
+      const A = posOf(w.nodes[k]), B = posOf(w.nodes[k+1]);
+      if(!A || !B) continue;
+      const x0 = Math.floor(Math.min(A[0],B[0])/CELL), x1 = Math.floor(Math.max(A[0],B[0])/CELL);
+      const y0 = Math.floor(Math.min(A[1],B[1])/CELL), y1 = Math.floor(Math.max(A[1],B[1])/CELL);
+      for(let cx=x0; cx<=x1; cx++) for(let cy=y0; cy<=y1; cy++){
+        const bk = cx+','+cy;
+        if(!grid.has(bk)) grid.set(bk, []);
+        grid.get(bk).push({ w, k, A, B });
+      }
+    }
+  }
+
+  const inserts = new Map();
+  let added = 0;
+  const seen = new Set();
+  const reach = Math.ceil(STITCH_DIST / CELL);
+  for(const leaf of leaves){
+    if(seen.has(leaf.key)) continue;
+    seen.add(leaf.key);
+    const p = posOf(leaf.key);
+    if(!p) continue;
+    const cx = Math.floor(p[0]/CELL), cy = Math.floor(p[1]/CELL);
+    let best = null;
+    for(let i=-reach; i<=reach; i++) for(let j=-reach; j<=reach; j++){
+      const arr = grid.get((cx+i)+','+(cy+j));
+      if(!arr) continue;
+      for(const seg of arr){
+        const w = seg.w, k = seg.k;
+        if(w.nodes[k] === leaf.key || w.nodes[k+1] === leaf.key) continue;
+        const A = seg.A, B = seg.B;
+        const dx = B[0]-A[0], dy = B[1]-A[1];
+        const L2 = dx*dx + dy*dy;
+        let t = L2 ? ((p[0]-A[0])*dx + (p[1]-A[1])*dy)/L2 : 0;
+        if(t < 0) t = 0; else if(t > 1) t = 1;
+        const qx = A[0]+dx*t, qy = A[1]+dy*t;
+        const d = Math.hypot(p[0]-qx, p[1]-qy);
+        if(d <= STITCH_DIST && (!best || d < best.d)) best = { w, k, t, qx, qy, d };
+      }
+    }
+    if(!best) continue;
+    const bp = toLngLat(best.qx, best.qy);
+    if(!inBox(bp[0], bp[1])) continue;
+    let targetKey;
+    if(best.t < 0.02) targetKey = best.w.nodes[best.k];
+    else if(best.t > 0.98) targetKey = best.w.nodes[best.k+1];
+    else {
+      const ll = toLngLat(best.qx, best.qy);
+      targetKey = roadKey(ll[0], ll[1]);
+      if(!nodeEls.has(targetKey)){
+        const el = { type:'node', id:targetKey, lon:ll[0], lat:ll[1] };
+        nodeEls.set(targetKey, el);
+        osm.elements.push(el);
+      }
+      if(!inserts.has(best.w)) inserts.set(best.w, []);
+      inserts.get(best.w).push({ k:best.k, t:best.t, key:targetKey });
+    }
+    if(targetKey === leaf.key) continue;
+    osm.elements.push({ type:'way', id:'weld'+added, nodes:[leaf.key, targetKey], tags:{ highway:'minor' } });
+    added++;
+  }
+
+  for(const [w, list] of inserts){
+    list.sort((a,b) => b.k - a.k || b.t - a.t);
+    for(const it of list){
+      if(!w.nodes.includes(it.key)) w.nodes.splice(it.k+1, 0, it.key);
+    }
+  }
+  return added;
 }
 
 // Roads are cached per play-area box and shared by concurrent requests, so
@@ -1762,7 +2009,9 @@ async function startGame(){
     let osm;
     try{ osm = await fetchRoads(bb); } finally { clearInterval(ticker); }
     stitchWays(osm, bb);
-    const g = buildGraph(osm, bb);
+    nodeCrossings(osm, bb);
+    let g = buildGraph(osm, bb);
+    if(weldLooseEnds(osm, bb, g)) g = buildGraph(osm, bb);
     state.edges = g.edges; state.adjSim = g.adjSim; state.boundary = g.boundary;
     clipDotlessEdges();
     buildWraps(bb);
