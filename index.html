@@ -2163,8 +2163,7 @@ function bindStick(){
     const travel = Math.min(len, R);
     knob.style.transform = 'translate(' + (dx/len*travel).toFixed(1) + 'px,' + (dy/len*travel).toFixed(1) + 'px)';
     if(len / R < DEAD){
-      if(stick) rememberTurn(stick);
-      stick = null;
+      stick = null; lastStick = null;
       return;
     }
     stick = { x: dx/len, y: -dy/len };   // screen down -> world north-up
