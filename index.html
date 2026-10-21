@@ -597,6 +597,8 @@ function nodeCrossings(osm, bb){
   });
 
   const CELL = 24;
+  const T_JOIN_DIST = 3;
+  const T_JOIN_EPS = 0.75;
   const grid = new Map();
   for(let si=0; si<segs.length; si++){
     const s = segs[si];
@@ -654,6 +656,45 @@ function nodeCrossings(osm, bb){
       const key = ensureNode(x, y);
       addInsert(ws, s.k, st, key);
       addInsert(wt, t.k, tu, key);
+    }
+  }
+
+  for(let wi=0; wi<ways.length; wi++){
+    const w = ways[wi];
+    for(let vi=0; vi<w.nodes.length; vi++){
+      const key = w.nodes[vi];
+      const el = nodeEls.get(key), p = posOf(key);
+      if(!el || !p || !inBox(el.lon, el.lat)) continue;
+      const cx = Math.floor(p[0]/CELL), cy = Math.floor(p[1]/CELL);
+      const byWay = new Map();
+      for(let i=-1; i<=1; i++) for(let j=-1; j<=1; j++){
+        const arr = grid.get((cx+i)+','+(cy+j));
+        if(!arr) continue;
+        for(const si of arr){
+          const seg = segs[si];
+          if(seg.wi === wi) continue;
+          const other = ways[seg.wi];
+          if(other.nodes.includes(key)) continue;
+          if(!atGrade(w) || !atGrade(other)) continue;
+          if(layerOf(w) !== layerOf(other)) continue;
+          const dx = seg.B[0]-seg.A[0], dy = seg.B[1]-seg.A[1];
+          const L2 = dx*dx + dy*dy;
+          if(!L2) continue;
+          let t = ((p[0]-seg.A[0])*dx + (p[1]-seg.A[1])*dy)/L2;
+          if(t <= 0.02 || t >= 0.98) continue;
+          const qx = seg.A[0]+dx*t, qy = seg.A[1]+dy*t;
+          const d = Math.hypot(p[0]-qx, p[1]-qy);
+          const prev = byWay.get(seg.wi);
+          if(d <= T_JOIN_DIST && (!prev || d < prev.d)) byWay.set(seg.wi, { other, k:seg.k, t, d });
+        }
+      }
+      if(vi === 0 || vi === w.nodes.length - 1){
+        for(const c of byWay.values()) addInsert(c.other, c.k, c.t, key);
+      } else {
+        let best = null;
+        for(const c of byWay.values()) if(c.d <= T_JOIN_EPS && (!best || c.d < best.d)) best = c;
+        if(best) addInsert(best.other, best.k, best.t, key);
+      }
     }
   }
 
@@ -1013,6 +1054,52 @@ function pruneShortDeadEnds(minLen){
     adjSim.get(e.b).push({ edgeIndex:ei, node:e.b });
   });
   state.edges = kept;
+  state.adjSim = adjSim;
+}
+
+// Tile seams can leave two nearly identical edges between the same pair of
+// nodes. Keep the more detailed one when their shapes and lengths agree.
+function dedupeParallelEdges(){
+  const groups = new Map();
+  for(const e of state.edges){
+    if(e.a === e.b) continue;
+    const k = e.a < e.b ? e.a+'|'+e.b : e.b+'|'+e.a;
+    if(!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(e);
+  }
+  const segDist = (p, a, b) => {
+    const dx = b[0]-a[0], dy = b[1]-a[1], L2 = dx*dx+dy*dy;
+    let t = L2 ? ((p[0]-a[0])*dx + (p[1]-a[1])*dy)/L2 : 0;
+    t = Math.max(0, Math.min(1, t));
+    return Math.hypot(p[0]-a[0]-dx*t, p[1]-a[1]-dy*t);
+  };
+  const drop = new Set();
+  for(const group of groups.values()){
+    if(group.length < 2) continue;
+    group.sort((a,b) => b.coords.length-a.coords.length || b.length-a.length);
+    const keep = group[0];
+    for(let i=1; i<group.length; i++){
+      const e = group[i];
+      const ratio = Math.max(e.length, keep.length) / Math.max(1e-6, Math.min(e.length, keep.length));
+      if(ratio > 1.2) continue;
+      let far = 0;
+      for(const p of e.coords){
+        let d = Infinity;
+        for(let k=0; k+1<keep.coords.length; k++) d = Math.min(d, segDist(p, keep.coords[k], keep.coords[k+1]));
+        far = Math.max(far, d);
+      }
+      if(far < 6) drop.add(e);
+    }
+  }
+  if(!drop.size) return;
+  state.edges = state.edges.filter(e => !drop.has(e));
+  const adjSim = new Map();
+  state.edges.forEach((e, ei) => {
+    if(!adjSim.has(e.a)) adjSim.set(e.a, []);
+    adjSim.get(e.a).push({ edgeIndex:ei, node:e.a });
+    if(!adjSim.has(e.b)) adjSim.set(e.b, []);
+    adjSim.get(e.b).push({ edgeIndex:ei, node:e.b });
+  });
   state.adjSim = adjSim;
 }
 
@@ -2119,6 +2206,7 @@ async function startGame(){
     let g = buildGraph(osm, bb);
     if(weldLooseEnds(osm, bb, g)) g = buildGraph(osm, bb);
     state.edges = g.edges; state.adjSim = g.adjSim; state.boundary = g.boundary;
+    dedupeParallelEdges();
     clipDotlessEdges();
     buildWraps(bb);
     pruneShortDeadEnds(MIN_STUB);
