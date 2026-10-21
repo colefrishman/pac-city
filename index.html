@@ -258,6 +258,10 @@ const EAT_RADIUS = 9;         // metres
 const CELL = 24;              // spatial grid cell (metres)
 const CATCH_RADIUS = 16;      // metres: a ghost this close to Pac-Man catches him
 const LIVES = 3;              // Pac-Man's spare lives when ghosts are on
+const DEATH_HOLD = 0.35;      // seconds frozen on the collision frame
+const DEATH_SPIN = 1.05;      // seconds of the spin/shrink animation
+const DEATH_END = 0.20;       // seconds to hold the empty frame before respawn
+const DEATH_TOTAL = DEATH_HOLD + DEATH_SPIN + DEATH_END;
 // Difficulty just decides how many ghosts roam and how fast they go. "Peaceful"
 // is the original, ghost-free game.
 const DIFFICULTIES = [
@@ -319,7 +323,8 @@ function toLngLat(x, y){ return [ proj.lng0 + x/proj.mlon, proj.lat0 + y/proj.ml
 
 const state = {
   running:false, loading:false, edges:[], adjSim:new Map(), pellets:[], grid:new Map(),
-  pac:null, score:0, level:1, last:0, dirty:false, lastPellet:0, marker:null, rot:null, pupils:[],
+  pac:null, score:0, level:1, last:0, dirty:false, lastPellet:0, marker:null, markerEl:null, rot:null, pupils:[],
+  dying:false, deathStart:0, deathDeg:0,
   boundary:new Set(), wrapMap:new Map(),
   ghosts:[], nodePos:new Map(), difficulty:'peaceful', lives:LIVES, invuln:0,
   ghostMode:'scatter', ghostModeTimer:4, overlayMode:'level',
@@ -1242,6 +1247,11 @@ function travelHeading(){
   return norm(dx,dy);
 }
 
+function pacHeadingDeg(){
+  const h = travelHeading();
+  return Math.atan2(-h.y, h.x) * 180/Math.PI;
+}
+
 // Direction of travel on the edge we arrived along, right at that node.
 function arrivalHeadingAt(cameIndex, nodeId){
   const e = state.edges[cameIndex];
@@ -1641,19 +1651,82 @@ function ghostCaught(x, y){
   return false;
 }
 
+function setPacAnimationsPaused(paused){
+  if(!state.rot) return;
+  const svg = state.rot.querySelector('svg');
+  if(!svg) return;
+  try {
+    if(paused && svg.pauseAnimations) svg.pauseAnimations();
+    if(!paused && svg.unpauseAnimations) svg.unpauseAnimations();
+  } catch(_){}
+}
+
+function clearDeath(){
+  state.dying = false;
+  state.deathStart = 0;
+  if(state.markerEl) state.markerEl.style.opacity = '';
+  if(state.rot){
+    state.rot.style.transform = '';
+    state.rot.style.opacity = '';
+    state.rot.style.filter = '';
+  }
+  setPacAnimationsPaused(false);
+}
+
 function respawnActors(){
+  clearDeath();
   spawnPac();
   clearGhosts();
   spawnGhosts();
   state.invuln = 2;
 }
 
-// A ghost touched Pac-Man: lose a life and restart the round, or end the game.
+// A ghost touched Pac-Man: freeze the frame, play the death, then respawn.
 function caught(){
+  if(state.dying) return;
   state.lives--;
   updateHud();
-  if(state.lives <= 0){ showGameOver(); return; }
+  state.dying = true;
+  state.deathStart = performance.now();
+  state.deathDeg = pacHeadingDeg();
+  turnBuf = null;
+  swipe = null;
+  if(state.markerEl) state.markerEl.style.opacity = '';
+  setPacAnimationsPaused(true);
+}
+
+function updateDeath(now){
+  if(!state.dying) return;
+  const t = Math.max(0, (now - state.deathStart) / 1000);
+  const p = Math.min(1, Math.max(0, (t - DEATH_HOLD) / DEATH_SPIN));
+  if(state.rot){
+    if(t < DEATH_HOLD){
+      state.rot.style.opacity = '1';
+      state.rot.style.filter = t < 0.10 ? 'brightness(1.8)' : '';
+    } else {
+      const ease = p*p*(3 - 2*p);
+      const pop = Math.sin(Math.PI * Math.min(1, p / 0.35));
+      const scale = Math.max(0, (1 + 0.18*pop) * (1 - Math.pow(p, 1.8)));
+      const opacity = p < 0.72 ? 1 : Math.max(0, 1 - (p - 0.72) / 0.28);
+      state.rot.style.transform =
+        'rotate(' + (state.deathDeg + 900*ease).toFixed(1) + 'deg) scale(' + scale.toFixed(3) + ')';
+      state.rot.style.opacity = opacity.toFixed(3);
+      state.rot.style.filter = '';
+    }
+  }
+  if(t >= DEATH_TOTAL) finishDeath();
+}
+
+function finishDeath(){
+  const out = state.lives <= 0;
+  state.dying = false;
+  if(out){ showGameOver(); return; }
   respawnActors();
+  const [x,y] = pacPos();
+  updatePacView(x,y);
+  updatePacInvuln();
+  for(const gh of state.ghosts) updateGhostView(gh);
+  state.last = performance.now();
 }
 
 function showGameOver(){
@@ -1895,6 +1968,7 @@ function addPacMarker(){
   const el = document.createElement('div');
   el.className = 'pac-marker';
   el.innerHTML = '<div class="pac-rot">' + characterSVG(characterById(chosenChar), false) + '</div>';
+  state.markerEl = el;
   state.rot = el.querySelector('.pac-rot');
   state.pupils = el.querySelectorAll ? Array.from(el.querySelectorAll('.pupil')) : [];
   state.marker = new maplibregl.Marker({ element: el, anchor:'center' }).setLngLat([0,0]).addTo(map);
@@ -1923,6 +1997,14 @@ function updatePacView(x, y){
   if(state.marker) state.marker.setLngLat(toLngLat(x, y));
 }
 
+function updatePacInvuln(){
+  if(!state.markerEl || state.dying) return;
+  const danger = difficultyById(state.difficulty).ghosts > 0;
+  state.markerEl.style.opacity = (danger && state.invuln > 0)
+    ? (Math.floor(state.invuln * 8) % 2 ? '0.35' : '1')
+    : '';
+}
+
 function updateHud(){
   const total = state.pellets.length + state.powerPellets.length;
   document.getElementById('score').textContent =
@@ -1939,6 +2021,11 @@ function frame(now){
   if(!state.running) return;
   const dt = Math.min(0.05, (now - state.last)/1000 || 0);
   state.last = now;
+  if(state.dying){
+    updateDeath(now);
+    if(state.running) requestAnimationFrame(frame);
+    return;
+  }
   movePac(dt);
   let [x,y] = pacPos();
   eatAround(x,y);
@@ -1951,13 +2038,14 @@ function frame(now){
         eatGhost(gh);                       // power pellet active: ghost is edible
       } else if(state.invuln <= 0){
         caught();
-        if(!state.running) return;
-        [x,y] = pacPos();
-        break;
+        updatePacView(x,y);
+        requestAnimationFrame(frame);
+        return;
       }
     }
   }
   updatePacView(x,y);
+  updatePacInvuln();
   renderPellets(false);
   updateHud();
   if((state.pellets.length + state.powerPellets.length) && dotsRemaining() === 0){ levelComplete(); return; }
@@ -2040,6 +2128,7 @@ async function startGame(){
     cleanWraps();
     if(state.edges.length < 5) throw new Error('Not enough connected roads here. Move to a city block and retry.');
 
+    clearDeath();
     state.score = 0; state.level = 1; state.pac = null;
     state.points = 0; state.frightTimer = 0; state.frightCombo = 0;
     state.difficulty = chosenDiff;
@@ -2064,6 +2153,7 @@ async function startGame(){
     updateHud();
     const [x,y] = pacPos();
     updatePacView(x,y);
+    updatePacInvuln();
     for(const gh of state.ghosts) updateGhostView(gh);
     state.last = performance.now();
     requestAnimationFrame(frame);
@@ -2106,6 +2196,7 @@ function levelComplete(){
 
 // Deal a fresh set of dots on the same streets, reset Pac-Man and the ghosts.
 function beginRound(){
+  clearDeath();
   state.score = 0;
   state.pac = null;
   state.frightTimer = 0; state.frightCombo = 0;
@@ -2120,6 +2211,7 @@ function beginRound(){
   updateHud();
   const [x,y] = pacPos();
   updatePacView(x,y);
+  updatePacInvuln();
   for(const gh of state.ghosts) updateGhostView(gh);
   state.running = true;
   state.last = performance.now();
