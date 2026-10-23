@@ -262,6 +262,12 @@ const DEATH_HOLD = 0.35;      // seconds frozen on the collision frame
 const DEATH_SPIN = 1.05;      // seconds of the spin/shrink animation
 const DEATH_END = 0.20;       // seconds to hold the empty frame before respawn
 const DEATH_TOTAL = DEATH_HOLD + DEATH_SPIN + DEATH_END;
+const START_EDGE_MIN = 40;    // metres: shortest road that can hold the start area
+const START_OFFSET = 55;      // metres from the start junction to Pac-Man
+const GHOST_HOUSE_RADIUS = 20;
+const GHOST_RELEASE_DELAY = 1.1;
+const GHOST_RELEASE_GAP = 0.85;
+const GHOST_RETURN_DELAY = 1.0;
 // Difficulty just decides how many ghosts roam and how fast they go. "Peaceful"
 // is the original, ghost-free game.
 const DIFFICULTIES = [
@@ -327,7 +333,7 @@ const state = {
   dying:false, deathStart:0, deathDeg:0,
   boundary:new Set(), wrapMap:new Map(),
   ghosts:[], nodePos:new Map(), difficulty:'peaceful', lives:LIVES, invuln:0,
-  ghostMode:'scatter', ghostModeTimer:4, overlayMode:'level',
+  start:null, ghostMode:'scatter', ghostModeTimer:4, overlayMode:'level',
   powerPellets:[], points:0, frightTimer:0, frightCombo:0
 };
 let keyHeld = null;       // { x, y } from keyboard
@@ -1502,7 +1508,62 @@ function eatAround(x,y){
   }
 }
 
+function setupStartArea(){
+  const edges = state.edges;
+  if(!edges.length){ state.start = null; return; }
+  let hEdge = -1, hNear = Infinity;
+  for(let i=0; i<edges.length; i++){
+    const e = edges[i];
+    if(e.length < START_EDGE_MIN) continue;
+    const m = pointAt(e, e.length/2);
+    const d = Math.hypot(m[0], m[1]);
+    if(d < hNear){ hNear = d; hEdge = i; }
+  }
+  if(hEdge < 0){
+    hEdge = 0;
+    for(let i=1; i<edges.length; i++) if(edges[i].length > edges[hEdge].length) hEdge = i;
+  }
+  const he = edges[hEdge];
+  const houseDist = he.length/2;
+  const house = pointAt(he, houseDist);
+  let pacEdge = -1, pacDist = houseDist, pacForward = true, pacScore = -Infinity;
+  const wantedSep = START_OFFSET + 20;
+  const seen = new Set([hEdge]);
+  for(const node of [he.a, he.b]){
+    for(const c of (state.adjSim.get(node) || [])){
+      if(seen.has(c.edgeIndex)) continue;
+      seen.add(c.edgeIndex);
+      const ce = edges[c.edgeIndex];
+      if(!ce) continue;
+      const fromA = ce.a === node;
+      const d = Math.min(START_OFFSET, ce.length/2);
+      const at = fromA ? d : ce.length - d;
+      const p = pointAt(ce, at);
+      const sep = Math.hypot(p[0]-house[0], p[1]-house[1]);
+      if(sep < CATCH_RADIUS + 12) continue;
+      const score = -Math.abs(sep - wantedSep);
+      if(score > pacScore){
+        pacScore = score;
+        pacEdge = c.edgeIndex;
+        pacDist = at;
+        pacForward = fromA;
+      }
+    }
+  }
+  if(pacEdge < 0){
+    pacEdge = hEdge;
+    pacDist = Math.min(he.length - 1, houseDist + START_OFFSET);
+    pacForward = true;
+  }
+  state.start = { houseEdgeIndex:hEdge, houseDist, pacEdgeIndex:pacEdge, pacDist, pacForward };
+}
+
 function spawnPac(){
+  if(state.start && state.edges[state.start.pacEdgeIndex]){
+    state.pac = { edgeIndex:state.start.pacEdgeIndex, dist:state.start.pacDist,
+      forward:state.start.pacForward, waitNode:null };
+    return;
+  }
   let e = null;
   for(let tries=0; tries<40 && !e; tries++){
     const c = state.edges[(Math.random()*state.edges.length)|0];
@@ -1519,7 +1580,17 @@ function pacPos(){
 }
 
 // ---------- ghosts ----------
-function ghostPos(gh){ return pointAt(state.edges[gh.edgeIndex], gh.dist); }
+function ghostPos(gh){
+  if(gh.inHouse && state.start){
+    const h = state.start;
+    const c = pointAt(state.edges[h.houseEdgeIndex], h.houseDist);
+    const n = state.ghosts.length || 1;
+    const a = -Math.PI/2 + (gh.houseSlot || 0) * Math.PI*2 / n;
+    const r = n > 1 ? 8 : 0;
+    return [ c[0] + Math.cos(a)*r, c[1] + Math.sin(a)*r, c[2] ];
+  }
+  return pointAt(state.edges[gh.edgeIndex], gh.dist);
+}
 
 // Position of every graph node (endpoints of the polylines), for ghost targeting.
 function buildNodePos(){
@@ -1546,26 +1617,34 @@ function clearGhosts(){
   state.ghosts = [];
 }
 
-// Drop the ghosts on edges well away from Pac-Man's spawn.
 function spawnGhosts(){
   clearGhosts();
   state.frightTimer = 0; state.frightCombo = 0;
   const diff = difficultyById(state.difficulty);
   if(!diff.ghosts || !state.edges.length || !state.pac) return;
   const p = pacPos();
-  const far = state.edges
-    .map((e, i) => ({ i, e }))
-    .filter(x => { const m = pointAt(x.e, x.e.length/2); return Math.hypot(m[0]-p[0], m[1]-p[1]) > 120; });
-  const pool = far.length ? far : state.edges.map((e,i) => ({ i, e }));
+  const house = state.start;
   const corners = state.bb ? [
-    toXY(state.bb.west,  state.bb.north), toXY(state.bb.east, state.bb.north),
-    toXY(state.bb.east,  state.bb.south), toXY(state.bb.west, state.bb.south)
+    toXY(state.bb.west,  state.bb.north), toXY(state.bb.east,  state.bb.north),
+    toXY(state.bb.east,  state.bb.south), toXY(state.bb.west,  state.bb.south)
   ] : [];
+  const far = !house ? state.edges
+    .map((e, i) => ({ i, e }))
+    .filter(x => { const m = pointAt(x.e, x.e.length/2); return Math.hypot(m[0]-p[0], m[1]-p[1]) > 120; }) : [];
+  const pool = !house ? (far.length ? far : state.edges.map((e,i) => ({ i, e }))) : [];
   for(let k=0; k<diff.ghosts; k++){
-    const pick = pool[(Math.random()*pool.length)|0];
     const def = GHOST_DEFS[k % GHOST_DEFS.length];
-    const gh = { edgeIndex:pick.i, dist:pick.e.length/2, forward:true, waitNode:null,
-      name:def.name, body:def.body, stroke:def.stroke, corner:corners[k % corners.length] || p };
+    let gh;
+    if(house && state.edges[house.houseEdgeIndex]){
+      gh = { edgeIndex:house.houseEdgeIndex, dist:house.houseDist, forward:true, waitNode:null,
+        inHouse:true, houseTime:GHOST_RELEASE_DELAY + k*GHOST_RELEASE_GAP, houseSlot:k,
+        name:def.name, body:def.body, stroke:def.stroke, corner:corners[k % corners.length] || p };
+    } else {
+      const pick = pool[(Math.random()*pool.length)|0];
+      gh = { edgeIndex:pick.i, dist:pick.e.length/2, forward:true, waitNode:null,
+        inHouse:false, houseTime:0, houseSlot:k,
+        name:def.name, body:def.body, stroke:def.stroke, corner:corners[k % corners.length] || p };
+    }
     state.ghosts.push(gh);
     addGhostMarker(gh);
   }
@@ -1604,8 +1683,18 @@ function applyGhostSkin(gh){
   gh.pupils = gh.el.querySelectorAll ? Array.from(gh.el.querySelectorAll('.pupil')) : [];
 }
 
-// Drop one ghost far from Pac-Man (used when a frightened ghost is eaten).
+// Send a ghost back to the house (used when a frightened ghost is eaten).
 function respawnOneGhost(gh){
+  if(state.start && state.edges[state.start.houseEdgeIndex]){
+    if(gh.houseSlot == null) gh.houseSlot = Math.max(0, state.ghosts.indexOf(gh));
+    gh.inHouse = true;
+    gh.houseTime = GHOST_RETURN_DELAY;
+    gh.edgeIndex = state.start.houseEdgeIndex;
+    gh.dist = state.start.houseDist;
+    gh.forward = true;
+    gh.waitNode = null;
+    return;
+  }
   if(!state.edges.length) return;
   const p = pacPos();
   const far = state.edges
@@ -1662,7 +1751,24 @@ function ghostChoose(gh, nodeId, cameIndex){
   return best ? { edgeIndex:best.edgeIndex, forward:dirFor(best.edgeIndex, nodeId) } : null;
 }
 
+function releaseGhost(gh){
+  gh.inHouse = false;
+  gh.houseTime = 0;
+  if(!state.start || !state.edges[state.start.houseEdgeIndex]) return;
+  const h = state.start;
+  const e = state.edges[h.houseEdgeIndex];
+  const target = gh.corner || pacPos();
+  const a = state.nodePos.get(e.a) || e.coords[0];
+  const b = state.nodePos.get(e.b) || e.coords[e.coords.length-1];
+  gh.edgeIndex = h.houseEdgeIndex;
+  gh.dist = h.houseDist;
+  gh.forward = Math.hypot(b[0]-target[0], b[1]-target[1]) <
+    Math.hypot(a[0]-target[0], a[1]-target[1]);
+  gh.waitNode = null;
+}
+
 function moveGhost(gh, dt){
+  if(gh.inHouse) return;
   let remaining = ghostSpeed() * (state.frightTimer > 0 ? 0.55 : 1) * dt;
   let guard = 0;
   while(remaining > 0 && guard++ < 24){
@@ -1727,11 +1833,21 @@ function updateGhosts(dt){
     state.ghostMode = state.ghostMode === 'chase' ? 'scatter' : 'chase';
     state.ghostModeTimer = state.ghostMode === 'chase' ? 8 : 5;
   }
-  for(const gh of state.ghosts){ moveGhost(gh, dt); applyGhostSkin(gh); updateGhostView(gh); }
+  for(const gh of state.ghosts){
+    if(gh.inHouse){
+      gh.houseTime -= dt;
+      if(gh.houseTime <= 0) releaseGhost(gh);
+      else { applyGhostSkin(gh); updateGhostView(gh); continue; }
+    }
+    moveGhost(gh, dt);
+    applyGhostSkin(gh);
+    updateGhostView(gh);
+  }
 }
 
 function ghostCaught(x, y){
   for(const gh of state.ghosts){
+    if(gh.inHouse) continue;
     const g = ghostPos(gh);
     if(Math.hypot(g[0]-x, g[1]-y) <= CATCH_RADIUS) return true;
   }
@@ -1764,6 +1880,8 @@ function respawnActors(){
   clearDeath();
   spawnPac();
   clearGhosts();
+  state.ghostMode = 'scatter';
+  state.ghostModeTimer = 4;
   spawnGhosts();
   state.invuln = 2;
 }
@@ -1925,6 +2043,21 @@ function boundaryData(){
   ]}};
 }
 
+function ghostHouseData(){
+  const st = state.start;
+  if(!st || !state.edges[st.houseEdgeIndex] || !difficultyById(state.difficulty).ghosts)
+    return { type:'FeatureCollection', features:[] };
+  const c = pointAt(state.edges[st.houseEdgeIndex], st.houseDist);
+  const ring = [];
+  for(let i=0; i<=32; i++){
+    const a = i/32 * Math.PI*2;
+    ring.push(toLngLat(c[0] + Math.cos(a)*GHOST_HOUSE_RADIUS, c[1] + Math.sin(a)*GHOST_HOUSE_RADIUS));
+  }
+  return { type:'FeatureCollection', features:[{
+    type:'Feature', properties:{}, geometry:{ type:'Polygon', coordinates:[ring] }
+  }]};
+}
+
 // Live dashed box on the map showing where the level will be, so the player can
 // see (and aim) the play area before starting.
 function previewData(){
@@ -2021,6 +2154,12 @@ function addLayers(){
     layout:{ 'line-cap':'round', 'line-join':'round' },
     paint:{ 'line-color':'#ffd23f', 'line-width':3.5, 'line-opacity':0.5 } });
 
+  map.addSource('ghosthouse', { type:'geojson', data: ghostHouseData() });
+  map.addLayer({ id:'ghosthouse-fill', type:'fill', source:'ghosthouse',
+    paint:{ 'fill-color':'#0b0d12', 'fill-opacity':0.5 } });
+  map.addLayer({ id:'ghosthouse-line', type:'line', source:'ghosthouse',
+    paint:{ 'line-color':'#ff9fd6', 'line-width':2, 'line-dasharray':[2,2], 'line-opacity':0.85 } });
+
   PORTAL_SHAPES.forEach((s, si) => {
     PORTAL_COLORS.forEach((c, ci) => {
       const name = 'portal-'+s+'-'+ci;
@@ -2044,11 +2183,19 @@ function addLayers(){
   renderPellets(true);
 }
 
+function removeGhostHouseLayers(){
+  for(const id of ['ghosthouse-fill','ghosthouse-line']){
+    if(map.getLayer(id)) map.removeLayer(id);
+  }
+  if(map.getSource('ghosthouse')) map.removeSource('ghosthouse');
+}
+
 function removeLayers(){
-  for(const id of ['bounds','roads','portals','pellets']){
+  for(const id of ['bounds','roads','ghosthouse-fill','ghosthouse-line','portals','pellets']){
     if(map.getLayer(id)) map.removeLayer(id);
     if(map.getSource(id)) map.removeSource(id);
   }
+  if(map.getSource('ghosthouse')) map.removeSource('ghosthouse');
 }
 
 function addPacMarker(){
@@ -2119,6 +2266,7 @@ function frame(now){
   updateGhosts(dt);
   if(state.ghosts.length){
     for(const gh of state.ghosts){
+      if(gh.inHouse) continue;
       const g = ghostPos(gh);
       if(Math.hypot(g[0]-x, g[1]-y) > CATCH_RADIUS) continue;
       if(state.frightTimer > 0){
@@ -2215,6 +2363,7 @@ async function startGame(){
     keepLargestComponent();
     cleanWraps();
     if(state.edges.length < 5) throw new Error('Not enough connected roads here. Move to a city block and retry.');
+    setupStartArea();
 
     clearDeath();
     state.score = 0; state.level = 1; state.pac = null;
@@ -2260,6 +2409,7 @@ function stopGame(){
   setPreviewVisible(true);
   updatePreview();
   clearGhosts();
+  removeGhostHouseLayers();
   document.getElementById('panel').hidden = false;
   document.getElementById('hud').hidden = true;
   document.getElementById('stick').hidden = true;
