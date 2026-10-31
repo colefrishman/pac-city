@@ -227,12 +227,12 @@ function characterSVG(ch, preview){
   return pacSVG(ch, preview);
 }
 
-const SPEED = 62;             // metres / second, at level 1
+const SPEED = 76;             // metres / second, at level 1
 const SPEED_STEP = 0.12;      // each cleared level makes Pac-Man this much faster
 const MAX_SPEED_MULT = 2.2;   // cap so later levels stay playable
 function speedFactor(){ return Math.min(MAX_SPEED_MULT, 1 + (state.level - 1) * SPEED_STEP); }
 const PELLET_SPACING = 25;    // minimum metres between dots (quiet rural roads)
-const TARGET_DOTS = 240;      // roughly how many dots the whole board aims for
+const TARGET_DOTS = 180;      // roughly how many dots the whole board aims for
 const MAX_SPACING_MULT = 2.8; // dense road systems may space dots out this much more
 const DOT_MIN_SEP = 16;       // metres: thin dots that still bunch together
 const EAT_RADIUS = 9;         // metres
@@ -2343,7 +2343,7 @@ async function startGame(){
     pruneShortDeadEnds(Infinity);   // leftover dead-ends with no partner: cut them
     keepLargestComponent();
     cleanWraps();
-    if(state.edges.length < 5) throw new Error('Not enough connected roads here. Move to a city block and retry.');
+    if(!state.edges.length) throw new Error('No connected roads here. Move the map and retry.');
     setupStartArea();
 
     clearDeath();
