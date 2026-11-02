@@ -68,6 +68,11 @@
     filter:drop-shadow(0 1px 2px #0009)}
   .pac-rot{will-change:transform;display:flex}
 
+  .fruit-marker{width:32px;height:32px;display:flex;align-items:center;justify-content:center;
+    filter:drop-shadow(0 2px 3px #0009)}
+  .fruit-bob{display:flex;animation:fruit-bob .7s ease-in-out infinite alternate}
+  @keyframes fruit-bob{from{transform:translateY(-2px)}to{transform:translateY(2px)}}
+
   #leveldone{position:absolute;inset:0;z-index:8;display:flex;align-items:center;justify-content:center;
     padding:20px;background:#00000055;backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px)}
   #leveldone .card{background:#fff;border-radius:18px;padding:22px 20px;width:min(340px,90vw);
@@ -236,6 +241,9 @@ const TARGET_DOTS = 180;      // roughly how many dots the whole board aims for
 const MAX_SPACING_MULT = 2.8; // dense road systems may space dots out this much more
 const DOT_MIN_SEP = 16;       // metres: thin dots that still bunch together
 const EAT_RADIUS = 9;         // metres
+const FRUIT_EAT_RADIUS = 14;  // metres
+const FRUIT_LIFETIME = 12;    // seconds before an uneaten fruit vanishes
+const FRUIT_TRIGGERS = [0.30, 0.70];
 const CELL = 24;              // spatial grid cell (metres)
 const CATCH_RADIUS = 16;      // metres: a ghost this close to Pac-Man catches him
 const LIVES = 3;              // Pac-Man's spare lives when ghosts are on
@@ -285,6 +293,81 @@ const COORD_Q = 1e6;            // quantize lng/lat (~0.1 m) so ways stitch at s
 const STITCH_DIST = 3;          // metres: a free road end this close to another road joins it
 const DRV = { up:{x:0,y:1}, down:{x:0,y:-1}, left:{x:-1,y:0}, right:{x:1,y:0} };
 
+// ---------- sound ----------
+let audioCtx = null;
+let lastChomp = 0;
+let chompFlip = false;
+
+function initAudio(){
+  if(!audioCtx){
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if(!AC) return;
+    try{ audioCtx = new AC(); }catch(_){ return; }
+  }
+  if(audioCtx.state === 'suspended'){
+    try{ audioCtx.resume().catch(() => {}); }catch(_){}
+  }
+}
+
+function tone(freq, dur, type, vol, delay, slide){
+  if(!audioCtx) return;
+  try{
+    const t = audioCtx.currentTime + (delay || 0);
+    const o = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    o.type = type || 'square';
+    o.frequency.setValueAtTime(freq, t);
+    if(slide) o.frequency.exponentialRampToValueAtTime(Math.max(40, slide), t + dur);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol || 0.03, t + 0.008);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g);
+    g.connect(audioCtx.destination);
+    o.start(t);
+    o.stop(t + dur + 0.03);
+  }catch(_){}
+}
+
+function sfxChomp(){
+  const now = performance.now();
+  if(now - lastChomp < 55) return;
+  lastChomp = now;
+  chompFlip = !chompFlip;
+  tone(chompFlip ? 620 : 430, 0.045, 'square', 0.022);
+  tone(chompFlip ? 930 : 645, 0.03, 'square', 0.012, 0.015);
+}
+
+function sfxPower(){
+  tone(300, 0.10, 'sawtooth', 0.03, 0, 520);
+  tone(520, 0.16, 'square', 0.025, 0.08, 840);
+}
+
+function sfxGhost(){
+  tone(880, 0.08, 'square', 0.035);
+  tone(660, 0.08, 'square', 0.035, 0.07);
+  tone(440, 0.10, 'square', 0.035, 0.14);
+  tone(660, 0.12, 'triangle', 0.03, 0.22);
+}
+
+function sfxFruit(){
+  [523, 659, 784, 1047].forEach((f, i) => tone(f, 0.11, 'square', 0.028, i*0.06));
+  tone(1319, 0.18, 'triangle', 0.03, 0.28, 1568);
+}
+
+function sfxDeath(){
+  [660, 590, 520, 440, 350, 270, 200].forEach((f, i) => tone(f, 0.12, 'sawtooth', 0.03, i*0.10, f*0.8));
+  tone(160, 0.5, 'triangle', 0.035, 0.7, 50);
+}
+
+function sfxStart(){
+  [523, 659, 784, 1047].forEach((f, i) => tone(f, 0.12, 'square', 0.03, i*0.08));
+}
+
+function sfxLevelClear(){
+  [659, 784, 988, 1319].forEach((f, i) => tone(f, 0.15, 'square', 0.03, i*0.1));
+  tone(1568, 0.35, 'triangle', 0.03, 0.42);
+}
+
 // Roads are cached per play-area box and shared by concurrent requests, so
 // panning around (prefetch) makes "Start" feel instant afterwards.
 const roadCache = new Map();
@@ -315,7 +398,7 @@ const state = {
   boundary:new Set(), wrapMap:new Map(),
   ghosts:[], nodePos:new Map(), difficulty:'peaceful', lives:LIVES, invuln:0,
   start:null, ghostMode:'scatter', ghostModeTimer:4, overlayMode:'level',
-  powerPellets:[], points:0, frightTimer:0, frightCombo:0
+  powerPellets:[], fruit:null, fruitNext:0, points:0, frightTimer:0, frightCombo:0
 };
 let keyHeld = null;       // { x, y } from keyboard
 let stick = null;         // { x, y } from the analog joystick
@@ -1468,15 +1551,103 @@ function dotsRemaining(){
   return n;
 }
 
+function fruitSVG(){
+  return '<svg viewBox="0 0 32 32" width="30" height="30">' +
+    '<path d="M17 7 C16 11 12 13 9 16" fill="none" stroke="#8a5a2b" stroke-width="1.6" stroke-linecap="round"/>' +
+    '<path d="M17 7 C18 11 22 13 24 16" fill="none" stroke="#8a5a2b" stroke-width="1.6" stroke-linecap="round"/>' +
+    '<path d="M17 7 C20 4 23 3 28 3 C26 7 22 8 17 7 Z" fill="#62c64a" stroke="#2f7a21" stroke-width="1"/>' +
+    '<circle cx="8.5" cy="21" r="6" fill="#ff4d57" stroke="#a51d2a" stroke-width="1.4"/>' +
+    '<circle cx="23.5" cy="21" r="6" fill="#ff4d57" stroke="#a51d2a" stroke-width="1.4"/>' +
+    '<circle cx="6.4" cy="18.4" r="1.5" fill="#ffffff" opacity="0.75"/>' +
+    '<circle cx="21.4" cy="18.4" r="1.5" fill="#ffffff" opacity="0.75"/>' +
+    '</svg>';
+}
+
+function clearFruit(){
+  if(state.fruit && state.fruit.marker) state.fruit.marker.remove();
+  state.fruit = null;
+}
+
+function resetFruit(){
+  clearFruit();
+  state.fruitNext = 0;
+}
+
+function fruitPos(){
+  const p = pacPos();
+  let best = null, bestD = Infinity;
+  for(const list of [state.pellets, state.powerPellets]){
+    for(const d of list){
+      if(d.eaten) continue;
+      if(Math.hypot(d.x-p[0], d.y-p[1]) < 60) continue;
+      const dCenter = Math.hypot(d.x, d.y);
+      if(dCenter < bestD){ bestD = dCenter; best = d; }
+    }
+  }
+  if(best) return [best.x, best.y];
+  if(state.start && state.edges[state.start.houseEdgeIndex]){
+    const c = pointAt(state.edges[state.start.houseEdgeIndex], state.start.houseDist);
+    return [c[0], c[1]];
+  }
+  return p;
+}
+
+function spawnFruit(){
+  if(state.fruit) return;
+  const [x, y] = fruitPos();
+  const el = document.createElement('div');
+  el.className = 'fruit-marker';
+  el.innerHTML = '<div class="fruit-bob">' + fruitSVG() + '</div>';
+  state.fruit = { x, y, ttl:FRUIT_LIFETIME, el,
+    marker:new maplibregl.Marker({ element:el, anchor:'center' }).setLngLat(toLngLat(x, y)).addTo(map) };
+  sfxFruit();
+}
+
+function maybeSpawnFruit(){
+  if(state.fruit || state.fruitNext >= FRUIT_TRIGGERS.length) return;
+  const total = state.pellets.length + state.powerPellets.length;
+  if(!total) return;
+  const at = Math.max(1, Math.floor(total * FRUIT_TRIGGERS[state.fruitNext]));
+  if(state.score < at) return;
+  state.fruitNext++;
+  spawnFruit();
+}
+
+function eatFruit(){
+  if(!state.fruit) return;
+  state.points += 100 * state.level;
+  clearFruit();
+  sfxFruit();
+  updateHud();
+}
+
+function updateFruit(dt){
+  if(!state.fruit) return;
+  const [x, y] = pacPos();
+  if(Math.hypot(state.fruit.x - x, state.fruit.y - y) <= FRUIT_EAT_RADIUS){
+    eatFruit();
+    return;
+  }
+  state.fruit.ttl -= dt;
+  if(state.fruit.ttl <= 0){ clearFruit(); return; }
+  if(state.fruit.el){
+    const blink = state.fruit.ttl < 3 && Math.floor(state.fruit.ttl * 6) % 2 === 0;
+    state.fruit.el.style.opacity = blink ? '0.35' : '1';
+  }
+}
+
 function eatAround(x,y){
   const cx = Math.floor(x/CELL), cy = Math.floor(y/CELL);
+  let ate = false, powered = false;
   for(let i=-1;i<=1;i++) for(let j=-1;j<=1;j++){
     const arr = state.grid.get((cx+i)+','+(cy+j));
     if(!arr) continue;
     for(const idx of arr){
       const p = state.pellets[idx];
       if(p.eaten) continue;
-      if(Math.hypot(p.x-x, p.y-y) <= EAT_RADIUS){ p.eaten = true; state.score++; state.points += 10; state.dirty = true; }
+      if(Math.hypot(p.x-x, p.y-y) <= EAT_RADIUS){
+        p.eaten = true; state.score++; state.points += 10; state.dirty = true; ate = true;
+      }
     }
   }
   // Few of them, so a plain scan is fine.
@@ -1484,9 +1655,11 @@ function eatAround(x,y){
     if(p.eaten) continue;
     if(Math.hypot(p.x-x, p.y-y) <= EAT_RADIUS){
       p.eaten = true; state.score++; state.points += 50;
-      state.dirty = true; activateFright();
+      state.dirty = true; powered = true; activateFright();
     }
   }
+  if(powered) sfxPower();
+  else if(ate) sfxChomp();
 }
 
 function setupStartArea(){
@@ -1689,6 +1862,7 @@ function respawnOneGhost(gh){
 function eatGhost(gh){
   state.points += 200 * Math.pow(2, Math.min(state.frightCombo, 3));
   state.frightCombo = Math.min(state.frightCombo + 1, 3);
+  sfxGhost();
   respawnOneGhost(gh);
   updateGhostView(gh);
   updateHud();
@@ -1872,6 +2046,7 @@ function caught(){
   if(state.dying) return;
   state.lives--;
   updateHud();
+  sfxDeath();
   state.dying = true;
   state.deathStart = performance.now();
   state.deathDeg = pacHeadingDeg();
@@ -1918,6 +2093,7 @@ function finishDeath(){
 function showGameOver(){
   state.running = false;
   state.overlayMode = 'caught';
+  clearFruit();
   document.getElementById('stick').hidden = true;
   document.getElementById('hud').hidden = true;
   document.getElementById('ld-title').textContent = 'Caught!';
@@ -2244,6 +2420,8 @@ function frame(now){
   movePac(dt);
   let [x,y] = pacPos();
   eatAround(x,y);
+  maybeSpawnFruit();
+  updateFruit(dt);
   updateGhosts(dt);
   if(state.ghosts.length){
     for(const gh of state.ghosts){
@@ -2310,6 +2488,7 @@ function unlockCamera(){
 }
 
 async function startGame(){
+  initAudio();
   const status = document.getElementById('status');
   try{
     setBusy(true);
@@ -2352,6 +2531,7 @@ async function startGame(){
     state.difficulty = chosenDiff;
     state.lives = LIVES;
     placePellets();
+    resetFruit();
     buildNodePos();
     spawnPac();
     document.getElementById('leveldone').hidden = true;
@@ -2374,6 +2554,7 @@ async function startGame(){
     updatePacInvuln();
     for(const gh of state.ghosts) updateGhostView(gh);
     state.last = performance.now();
+    sfxStart();
     requestAnimationFrame(frame);
   }catch(e){
     unlockCamera();
@@ -2390,6 +2571,7 @@ function stopGame(){
   setPreviewVisible(true);
   updatePreview();
   clearGhosts();
+  clearFruit();
   removeGhostHouseLayers();
   document.getElementById('panel').hidden = false;
   document.getElementById('hud').hidden = true;
@@ -2402,6 +2584,8 @@ function stopGame(){
 function levelComplete(){
   state.running = false;
   state.overlayMode = 'level';
+  clearFruit();
+  sfxLevelClear();
   document.getElementById('stick').hidden = true;
   document.getElementById('hud').hidden = true;
   document.getElementById('ld-title').textContent = 'Level ' + state.level + ' cleared!';
@@ -2420,6 +2604,7 @@ function beginRound(){
   state.pac = null;
   state.frightTimer = 0; state.frightCombo = 0;
   placePellets();
+  resetFruit();
   spawnPac();
   renderPellets(true);
   state.ghostMode = 'scatter'; state.ghostModeTimer = 4; state.invuln = 1.5;
@@ -2434,6 +2619,7 @@ function beginRound(){
   for(const gh of state.ghosts) updateGhostView(gh);
   state.running = true;
   state.last = performance.now();
+  sfxStart();
   requestAnimationFrame(frame);
 }
 
@@ -2500,6 +2686,7 @@ function bindControls(){
   const el = map.getContainer();
   let start = null;
   el.addEventListener('touchstart', e => {
+    initAudio();
     if(!state.running) return;
     const t = e.touches[0]; start = { x:t.clientX, y:t.clientY };
   }, { passive:true });
@@ -2519,6 +2706,7 @@ function bindControls(){
     w:'up', s:'down', a:'left', d:'right' };
   const held = [];                  // direction keys in press order
   addEventListener('keydown', e => {
+    initAudio();
     const dir = keys[e.key] || keys[e.key.toLowerCase()];
     if(!dir || !state.running) return;
     e.preventDefault();
